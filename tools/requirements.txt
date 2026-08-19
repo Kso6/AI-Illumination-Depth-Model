@@ -1,0 +1,47 @@
+# Python dependencies for the IlluminaDepth-448 training and export tools.
+#
+# Install with
+#     python -m pip install -r tools/requirements.txt
+#
+# Nothing here is needed to *run* the model: the browser half of the project has
+# no Python dependency at all, and the .idm container is written and read by
+# pure-Python code (array + struct) in tools/export/export_idm.py.
+#
+# Python 3.11 or newer.
+
+# --- always required ------------------------------------------------------
+#
+# torch >= 2.4 for the device-first torch.amp API ("torch.amp.autocast('cuda')"
+# and "torch.amp.GradScaler('cuda')") that tools/train/train.py uses; the older
+# torch.cuda.amp spelling is deprecated. Install the build that matches your
+# CUDA runtime from https://pytorch.org/get-started/locally/ *first* if you want
+# GPU support -- the default PyPI wheel is CPU-only on some platforms.
+torch>=2.4
+
+# Image decoding and augmentation in illumina/data.py. torchvision is not used:
+# the augmentation pipeline is Pillow plus torch, so that image and teacher
+# target can be transformed with the identical random parameters.
+Pillow>=10.0
+
+# torch pulls numpy in on most platforms, but illumina/data.py and the export
+# tools name it explicitly rather than relying on that.
+numpy>=1.26
+
+# --- required unless you use --teacher synthetic --------------------------
+#
+# The frozen teacher is Depth Anything V2 Small, loaded through
+# transformers.AutoModelForDepthEstimation. 4.45 is the first release with the
+# depth-anything image processor used by "depth-anything/Depth-Anything-V2-Small-hf".
+transformers>=4.45
+huggingface_hub>=0.25
+safetensors>=0.4
+
+# --- optional -------------------------------------------------------------
+#
+# accelerate makes transformers' device placement and low_cpu_mem_usage loading
+# path available; useful when the teacher is run on a second GPU.
+# accelerate>=0.34
+#
+# tensorboard, if you would rather read the metrics than the JSONL log that
+# train.py writes to <out>/log.jsonl.
+# tensorboard>=2.16

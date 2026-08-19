@@ -172,6 +172,15 @@ async function main(): Promise<void> {
 
   const profiler = new GpuProfiler(root.device, 4);
 
+  // Created once: `createView` allocates, and the frame loop must not.
+  const sceneColorView = source.texture.createView('render');
+  const sceneTruthView = source.truth.createView('render');
+  const scenePass = {
+    record: (pass: Parameters<typeof source.record>[0]) => source.record(pass),
+    colorTarget: sceneColorView,
+    truthTarget: sceneTruthView,
+  };
+
   // --- UI -----------------------------------------------------------------
   const statusEl = document.querySelector('#status');
   const statsEl = document.querySelector('#stats');
@@ -381,13 +390,7 @@ async function main(): Promise<void> {
       model,
       renderer,
       target: context,
-      scene: source.needsScenePass
-        ? {
-            record: (pass) => source.record(pass),
-            colorTarget: source.texture.createView('render'),
-            truthTarget: source.truth.createView('render'),
-          }
-        : undefined,
+      scene: source.needsScenePass ? scenePass : undefined,
       profiler,
       profile: state.profile,
     });

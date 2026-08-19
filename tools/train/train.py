@@ -30,7 +30,9 @@ Checkpoint schema (also read by ``tools/export/export_idm.py``)
 ``{"format": "illumina-ckpt/1", "arch": "IlluminaDepth-448", "input_size": int,
    "with_bn": bool, "step": int, "epoch": int, "model": state_dict,
    "ema": state_dict | None, "optimizer": ..., "scheduler": ..., "scaler": ...,
-   "metrics": dict, "args": dict, "teacher": str}``
+   "metrics": dict, "best_metric": float, "args": dict, "teacher": str}``
+
+Export the ``ema`` weights when they are present and ``model`` otherwise.
 
 The ``model`` and ``ema`` state dicts are the *training* (BatchNorm) shape.
 Folding happens at export time, not here, so that a checkpoint can always be
@@ -84,7 +86,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -95,7 +97,9 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from illumina.data import (  # noqa: E402
+    DEFAULT_TEACHER_ID,
     AugmentConfig,
+    DepthTeacher,
     DistillationDataset,
     TeacherCache,
     build_teacher,
@@ -104,11 +108,7 @@ from illumina.data import (  # noqa: E402
     precompute_teacher_cache,
     split_paths,
 )
-from illumina.losses import (  # noqa: E402
-    compute_scale_and_shift,
-    gradient_matching_loss,
-    ssi_loss,
-)
+from illumina.losses import align_prediction, midas_loss  # noqa: E402
 from illumina.model import build_model  # noqa: E402
 
 CHECKPOINT_FORMAT = "illumina-ckpt/1"
@@ -178,7 +178,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="fraction of --data-root held out for validation (hash split, "
         "stable when images are added)",
     )
-    data.add_argument("--input-size", type=int, default=448, help="must be a multiple of 32")
+    data.add_argument(
+        "--input-size", type=int, default=448, help="must be a multiple of 32"
+    )
     data.add_argument("--num-workers", type=int, default=8)
     data.add_argument(
         "--limit-images",
@@ -188,10 +190,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
 
     aug = parser.add_argument_group("augmentation")
-    aug.add_argument("--scale-min", type=float, default=0.25, help="min crop area fraction")
+    aug.add_argument(
+        "--scale-min", type=float, default=0.25, help="min crop area fraction"
+    )
     aug.add_argument("--scale-max", type=float, default=1.0)
     aug.add_argument("--hflip-prob", type=float, default=0.5)
-    aug.add_argument("--jitter", type=float, default=0.35, help="brightness/contrast/saturation strength")
+    aug.add_argument(
+        "--jitter",
+        type=float,
+        default=0.35,
+        help="brightness / contrast / saturation strength",
+    )
     aug.add_argument("--hue", type=float, default=0.05, help="hue jitter, in turns")
     aug.add_argument(
         "--exposure-jitter",
@@ -220,14 +229,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="fill any missing --teacher-cache entries before training",
     )
-    teach.add_argument("--teacher-max-side", type=int, default=512, help="cached long side")
+    teach.add_argument(
+        "--teacher-max-side", type=int, default=512, help="cached long side"
+    )
     teach.add_argument(
         "--teacher-dtype", default="fp16", choices=["fp32", "fp16", "bf16"]
     )
-    teach.add_argument("--teacher-batch-size", type=int, default=8, help="for --precompute")
+    teach.add_argument(
+        "--teacher-batch-size", type=int, default=8, help="for --precompute"
+    )
 
     optim = parser.add_argument_group("optimisation")
-    optim.add_argument("--batch-size", type=int, default=32, help="per optimiser micro-batch")
+    optim.add_argument(
+        "--batch-size", type=int, default=32, help="per optimiser micro-batch"
+    )
     optim.add_argument(
         "--accum-steps",
         type=int,
@@ -236,19 +251,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     optim.add_argument("--epochs", type=int, default=30)
     optim.add_argument(
-        "--max-steps", type=int, default=0, help="stop after N optimiser steps; 0 means no cap"
+        "--max-steps",
+        type=int,
+        default=0,
+        help="stop after N optimiser steps; 0 means no cap",
     )
     optim.add_argument("--lr", type=float, default=3e-4, help="peak learning rate")
-    optim.add_argument("--min-lr-ratio", type=float, default=0.02, help="cosine floor, as a fraction of --lr")
+    optim.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.02,
+        help="cosine floor, as a fraction of --lr",
+    )
     optim.add_argument("--weight-decay", type=float, default=0.02)
     optim.add_argument("--warmup-steps", type=int, default=1000)
     optim.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.99))
-    optim.add_argument("--grad-clip", type=float, default=1.0, help="0 disables clipping")
+    optim.add_argument(
+        "--grad-clip", type=float, default=1.0, help="0 disables clipping"
+    )
     optim.add_argument(
         "--trim",
         type=float,
         default=0.2,
         help="fraction of the largest residuals dropped by the trimmed SSI loss",
+    )
+    optim.add_argument(
+        "--grad-scales",
+        type=int,
+        default=4,
+        help="scales K in the gradient-matching term (MiDaS uses 4)",
     )
     optim.add_argument(
         "--reg-weight",
@@ -265,14 +296,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "matches deployment, where a joint bilateral filter -- not a bilinear "
         "upsample -- produces the full-resolution map",
     )
-    optim.add_argument("--ema-decay", type=float, default=0.9998, help="0 disables the EMA")
+    optim.add_argument(
+        "--ema-decay", type=float, default=0.9998, help="0 disables the EMA"
+    )
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     runtime.add_argument(
-        "--amp", default="bf16", choices=["off", "fp16", "bf16"], help="mixed precision mode"
+        "--amp",
+        default="bf16",
+        choices=["off", "fp16", "bf16"],
+        help="mixed precision mode",
     )
     runtime.add_argument("--seed", type=int, default=1)
     runtime.add_argument(
@@ -285,14 +321,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
 
     out = parser.add_argument_group("output")
-    out.add_argument("--out", required=True, help="run directory for checkpoints and logs")
-    out.add_argument("--resume", default=None, help="checkpoint to resume from")
-    out.add_argument("--log-every", type=int, default=50, help="steps between log lines")
     out.add_argument(
-        "--val-every", type=int, default=0, help="steps between validations; 0 means once per epoch"
+        "--out", required=True, help="run directory for checkpoints and logs"
     )
-    out.add_argument("--save-every", type=int, default=2000, help="steps between checkpoints")
-    out.add_argument("--val-batches", type=int, default=0, help="cap validation batches; 0 means all")
+    out.add_argument("--resume", default=None, help="checkpoint to resume from")
+    out.add_argument(
+        "--log-every", type=int, default=50, help="steps between log lines"
+    )
+    out.add_argument(
+        "--val-every",
+        type=int,
+        default=0,
+        help="steps between validations; 0 means once per epoch",
+    )
+    out.add_argument(
+        "--save-every", type=int, default=2000, help="steps between checkpoints"
+    )
+    out.add_argument(
+        "--val-batches",
+        type=int,
+        default=0,
+        help="cap validation batches; 0 means all",
+    )
     out.add_argument(
         "--metric-min-disparity",
         type=float,
@@ -300,7 +350,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="disparity floor before inverting to depth for AbsRel/delta1; the "
         "metrics are only comparable across runs that share this value",
     )
-    out.add_argument("--dry-run", action="store_true", help="print the cost estimate and exit")
+    out.add_argument(
+        "--dry-run", action="store_true", help="print the cost estimate and exit"
+    )
 
     args = parser.parse_args(argv)
     if args.input_size % 32 != 0:
@@ -329,23 +381,6 @@ def set_seed(seed: int, deterministic: bool) -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
     else:
         torch.backends.cudnn.benchmark = True
-
-
-def _accepts(fn: Callable[..., Any], name: str) -> bool:
-    """True if ``fn`` takes a keyword argument called ``name``.
-
-    ``losses.py`` owns the exact spelling of its optional knobs. Probing the
-    signature lets this script pass ``trim=`` (and friends) when they exist and
-    stay silent when they do not, instead of hard-failing on a name mismatch
-    between two files that are otherwise independent.
-    """
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):  # builtins, C extensions
-        return False
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return True
-    return name in params
 
 
 def as_disparity(pred: Tensor) -> Tensor:
@@ -417,7 +452,9 @@ class ModelEma:
         for key, value in self.module.state_dict().items():
             incoming = source[key]
             if value.is_floating_point():
-                value.mul_(decay).add_(incoming.detach().to(value.dtype), alpha=1 - decay)
+                value.mul_(decay).add_(
+                    incoming.detach().to(value.dtype), alpha=1 - decay
+                )
             else:
                 value.copy_(incoming)
 
@@ -526,27 +563,28 @@ def distillation_loss(
     mask: Tensor,
     trim: float,
     reg_weight: float,
+    scales: int,
 ) -> LossTerms:
     """``L = L_ssi(trimmed) + reg_weight * L_reg``, computed in float32.
 
-    Both terms come from ``illumina.losses``; the composition lives here so the
-    weighting is visible in the training script and adjustable from the CLI.
-    Autocast is disabled around the loss because the closed-form scale/shift
-    solve accumulates sums over 50 k pixels, where fp16 loses too much.
+    Delegates to ``illumina.losses.midas_loss``, which solves the least-squares
+    affine alignment once and feeds the *aligned* prediction to both terms.
+    That sharing is not just an optimisation: the gradient-matching term is only
+    scale-invariant if it sees an aligned prediction, so computing it on the raw
+    output would quietly penalise the prediction's arbitrary scale.
+
+    Called outside autocast -- the alignment accumulates sums over ~50 k pixels
+    per image, where fp16 loses too much precision.
     """
-    pred32 = pred.float()
-    target32 = target.float()
-
-    ssi_kwargs: dict[str, Any] = {}
-    if trim > 0.0:
-        for name in ("trim", "trim_fraction", "trim_ratio"):
-            if _accepts(ssi_loss, name):
-                ssi_kwargs[name] = trim
-                break
-
-    ssi = ssi_loss(pred32, target32, mask, **ssi_kwargs)
-    reg = gradient_matching_loss(pred32, target32, mask)
-    return LossTerms(total=ssi + reg_weight * reg, ssi=ssi.detach(), reg=reg.detach())
+    total, parts = midas_loss(
+        pred.float(),
+        target.float(),
+        mask,
+        alpha=reg_weight,
+        scales=scales,
+        trim=trim,
+    )
+    return LossTerms(total=total, ssi=parts["ssi"], reg=parts["reg"])
 
 
 def build_mask(target: Tensor, min_valid: float = 0.0) -> Tensor:
@@ -561,23 +599,6 @@ def build_mask(target: Tensor, min_valid: float = 0.0) -> Tensor:
     if min_valid > 0.0:
         mask = mask & (target > min_valid)
     return mask
-
-
-def affine_align(pred: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    """Least-squares alignment of ``pred`` onto ``target`` (per image).
-
-    Relative depth is only defined up to a positive scale and a shift, so any
-    metric must first solve for the pair that best explains the target. This is
-    the same closed form the training loss uses, reused here so the reported
-    numbers and the optimised objective agree about what "aligned" means.
-    """
-    result = compute_scale_and_shift(pred, target, mask)
-    if isinstance(result, (tuple, list)):
-        scale, shift = result[0], result[1]
-    else:  # a single stacked (N, 2) tensor
-        scale, shift = result[..., 0], result[..., 1]
-    shape = (-1,) + (1,) * (pred.dim() - 1)
-    return scale.reshape(shape) * pred + shift.reshape(shape)
 
 
 def depth_metrics(
@@ -637,7 +658,7 @@ def make_input(
 def resolve_target(
     batch: dict[str, Tensor],
     device: torch.device,
-    teacher: Any,
+    teacher: DepthTeacher | None,
 ) -> Tensor:
     """Returns ``(N, 1, S, S)`` teacher disparity, from cache or run online.
 
@@ -673,7 +694,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
-    teacher: Any,
+    teacher: DepthTeacher | None,
     in_channels: int,
     amp_dtype: torch.dtype | None,
 ) -> dict[str, float]:
@@ -689,14 +710,20 @@ def evaluate(
         inputs = make_input(batch, device, in_channels)
         target = resolve_target(batch, device, teacher)
         with torch.autocast(
-            device_type=device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
+            device_type=device.type,
+            dtype=amp_dtype or torch.float32,
+            enabled=amp_dtype is not None,
         ):
             pred = model(inputs)
         pred, target_r = prepare_pair(pred.float(), target, args.supervise_at)
         mask = build_mask(target_r)
-        terms = distillation_loss(pred, target_r, mask, args.trim, args.reg_weight)
+        terms = distillation_loss(
+            pred, target_r, mask, args.trim, args.reg_weight, args.grad_scales
+        )
 
-        aligned = affine_align(pred.float(), target_r, mask)
+        # Same closed form the objective uses, so the reported numbers and
+        # the optimised loss agree about what "aligned" means.
+        aligned = align_prediction(pred.float(), target_r, mask)
         abs_rel, delta1, disp_mae = depth_metrics(
             aligned, target_r, mask, args.metric_min_disparity
         )
@@ -705,7 +732,11 @@ def evaluate(
         seen += count
         totals["ssi"] += float(terms.ssi) * count
         totals["reg"] += float(terms.reg) * count
-        for key, value in (("abs_rel", abs_rel), ("delta1", delta1), ("disp_mae", disp_mae)):
+        for key, value in (
+            ("abs_rel", abs_rel),
+            ("delta1", delta1),
+            ("disp_mae", disp_mae),
+        ):
             if not math.isnan(value):
                 totals[key] += value * count
 
@@ -735,6 +766,7 @@ def save_checkpoint(
     metrics: dict[str, float],
     args: argparse.Namespace,
     teacher_name: str,
+    best_metric: float = float("inf"),
 ) -> None:
     """Writes a checkpoint atomically (temp file plus rename).
 
@@ -755,6 +787,7 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "metrics": metrics,
+        "best_metric": best_metric,
         "args": vars(args),
         "teacher": teacher_name,
     }
@@ -772,8 +805,13 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     scaler: torch.amp.GradScaler | None,
     device: torch.device,
-) -> tuple[int, int]:
-    """Restores a run. Returns ``(step, epoch)``."""
+) -> tuple[int, int, float]:
+    """Restores a run. Returns ``(step, epoch, best_metric)``.
+
+    The best metric travels with the checkpoint because a resumed run that
+    started from ``inf`` would overwrite a good ``best.pt`` with the first
+    validation it happens to do, however bad.
+    """
     state = torch.load(path, map_location=device, weights_only=False)
     if state.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(
@@ -789,7 +827,11 @@ def load_checkpoint(
         scheduler.load_state_dict(state["scheduler"])
     if scaler is not None and state.get("scaler") is not None:
         scaler.load_state_dict(state["scaler"])
-    return int(state.get("step", 0)), int(state.get("epoch", 0))
+    return (
+        int(state.get("step", 0)),
+        int(state.get("epoch", 0)),
+        float(state.get("best_metric", float("inf"))),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +865,10 @@ def print_cost_estimate(
     print(f"  epochs                  : {args.epochs}")
     print(f"  total samples seen      : {total_samples:,}")
     print(f"  effective batch         : {args.batch_size * args.accum_steps}")
-    print(f"  student fwd (inference) : {STUDENT_GFLOP_FORWARD * scale:.2f} GFLOP/image")
+    print(
+        f"  student fwd (inference) : "
+        f"{STUDENT_GFLOP_FORWARD * scale:.2f} GFLOP/image"
+    )
     print(f"  student train step      : {step_gflop:.2f} GFLOP/image (fwd + bwd)")
     print(f"  total student compute   : {total_samples * step_gflop / 1e6:.1f} PFLOP")
     if cached:
@@ -933,7 +978,13 @@ def make_loaders(
         train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **common
     )
     val_loader = (
-        DataLoader(val_set, batch_size=args.batch_size, shuffle=False, drop_last=False, **common)
+        DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **common,
+        )
         if val_set is not None
         else None
     )
@@ -963,6 +1014,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     teacher = None
     cache: TeacherCache | None = None
     teacher_name = args.teacher
+    teacher_dtype = dtypes[args.teacher_dtype]
+    if device.type == "cpu" and teacher_dtype is not torch.float32:
+        print("cpu device: forcing the teacher to fp32")
+        teacher_dtype = torch.float32
 
     if args.teacher_cache:
         # The cache key includes the teacher name, so it has to be resolved
@@ -1002,9 +1057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"    python -m illumina.data --root {args.data_root} "
                 f"--cache-dir {args.teacher_cache}"
             )
-        builder = build_teacher(
-            args.teacher, device=device, dtype=dtypes[args.teacher_dtype]
-        )
+        builder = build_teacher(args.teacher, device=device, dtype=teacher_dtype)
         precompute_teacher_cache(
             all_paths,
             builder,
@@ -1016,9 +1069,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if device.type == "cuda":
             torch.cuda.empty_cache()
     elif cache is None:
-        teacher = build_teacher(
-            args.teacher, device=device, dtype=dtypes[args.teacher_dtype]
-        )
+        teacher = build_teacher(args.teacher, device=device, dtype=teacher_dtype)
         teacher_name = teacher.name
 
     # --- data --------------------------------------------------------------
@@ -1029,7 +1080,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = build_model(input_size=args.input_size, with_bn=True).to(device)
     in_channels = stem_in_channels(model)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"model: {n_params:,} trainable parameters, stem expects {in_channels} channels")
+    print(
+        f"model: {n_params:,} trainable parameters, "
+        f"stem expects {in_channels} channels"
+    )
     if args.compile:
         model = torch.compile(model)
 
@@ -1042,22 +1096,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         total_steps = min(total_steps, args.max_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: cosine_warmup(step, args.warmup_steps, total_steps, args.min_lr_ratio),
+        lambda step: cosine_warmup(
+            step, args.warmup_steps, total_steps, args.min_lr_ratio
+        ),
     )
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is torch.float16)
 
     step = 0
     start_epoch = 0
+    best_metric = float("inf")
     if args.resume:
-        step, start_epoch = load_checkpoint(
+        step, start_epoch, best_metric = load_checkpoint(
             args.resume, model, ema, optimizer, scheduler, scaler, device
         )
-        print(f"resumed from {args.resume} at step {step}, epoch {start_epoch}")
+        print(
+            f"resumed from {args.resume} at step {step}, epoch {start_epoch}"
+            + (f", best AbsRel {best_metric:.4f}" if best_metric < float("inf") else "")
+        )
 
-    best_metric = float("inf")
     window_samples = 0
     window_start = time.time()
     stop = False
+    completed_epoch = start_epoch
 
     for epoch in range(start_epoch, args.epochs):
         if stop:
@@ -1082,7 +1142,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # ~50 k pixels and loses too much precision in fp16.
             pred_r, target_r = prepare_pair(pred.float(), target, args.supervise_at)
             mask = build_mask(target_r)
-            terms = distillation_loss(pred_r, target_r, mask, args.trim, args.reg_weight)
+            terms = distillation_loss(
+                pred_r, target_r, mask, args.trim, args.reg_weight, args.grad_scales
+            )
             scaler.scale(terms.total / args.accum_steps).backward()
 
             epoch_samples += inputs.shape[0]
@@ -1139,7 +1201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.save_every and step % args.save_every == 0:
                 save_checkpoint(
                     out_dir / "last.pt", model, ema, optimizer, scheduler, scaler,
-                    step, epoch, {}, args, teacher_name,
+                    step, epoch, {}, args, teacher_name, best_metric,
                 )
 
             if args.max_steps and step >= args.max_steps:
@@ -1147,6 +1209,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stop = True
                 break
 
+        # An epoch cut short by --max-steps is not a completed epoch: recording
+        # it as one would make a resume skip the rest of its data.
+        completed_epoch = epoch if stop else epoch + 1
         epoch_time = time.time() - epoch_start
         rate = epoch_samples / max(epoch_time, 1e-6)
         remaining = max(args.epochs - epoch - 1, 0)
@@ -1162,22 +1227,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if val_loader is not None:
             best_metric = _validate_and_save(
                 model, ema, val_loader, device, args, teacher, in_channels,
-                amp_dtype, optimizer, scheduler, scaler, step, epoch + 1,
+                amp_dtype, optimizer, scheduler, scaler, step, completed_epoch,
                 out_dir, log_path, best_metric, teacher_name,
             )
         save_checkpoint(
             out_dir / "last.pt", model, ema, optimizer, scheduler, scaler,
-            step, epoch + 1, {}, args, teacher_name,
+            step, completed_epoch, {}, args, teacher_name, best_metric,
         )
 
     save_checkpoint(
         out_dir / "last.pt", model, ema, optimizer, scheduler, scaler,
-        step, args.epochs, {}, args, teacher_name,
+        step, completed_epoch, {}, args, teacher_name, best_metric,
     )
+    best_path = out_dir / "best.pt"
+    export_from = best_path if best_path.is_file() else out_dir / "last.pt"
     print(f"done. checkpoints in {out_dir}")
+    if not best_path.is_file():
+        print("no best.pt: nothing was validated (no validation split)")
     print("Export with:")
     print(
-        f"    python tools/export/export_idm.py --checkpoint {out_dir / 'best.pt'} "
+        f"    python tools/export/export_idm.py --checkpoint {export_from} "
         "--out public/weights.idm"
     )
     return 0
@@ -1189,7 +1258,7 @@ def _validate_and_save(
     val_loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
-    teacher: Any,
+    teacher: DepthTeacher | None,
     in_channels: int,
     amp_dtype: torch.dtype | None,
     optimizer: torch.optim.Optimizer,
@@ -1233,7 +1302,7 @@ def _validate_and_save(
         best_metric = selection
         save_checkpoint(
             out_dir / "best.pt", model, ema, optimizer, scheduler, scaler,
-            step, epoch, record, args, teacher_name,
+            step, epoch, record, args, teacher_name, best_metric,
         )
         print(f"  new best AbsRel {best_metric:.4f} -> {out_dir / 'best.pt'}")
     return best_metric

@@ -148,7 +148,7 @@ export function createRenderer(root: TgpuRoot, options: RendererOptions): Render
   const lightBuffer = root.createBuffer(LightBuffer, packLights([])).$usage('storage');
 
   const shadePipeline: TgpuComputePipeline = root.createComputePipeline({
-    compute: makeShade({ lightCount: 8 }).fn,
+    compute: makeShade().fn,
   });
 
   const compositePipeline: TgpuRenderPipeline = root.createRenderPipeline({

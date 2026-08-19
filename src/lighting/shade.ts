@@ -34,7 +34,7 @@
 import tgpu from 'typegpu';
 import * as d from 'typegpu/data';
 import * as std from 'typegpu/std';
-import { LightBuffer } from './lights.ts';
+import { LightBuffer, MAX_LIGHTS } from './lights.ts';
 import { srgbToLinear } from '../model/kernels/io.ts';
 
 export const ShadeParams = d.struct({
@@ -297,11 +297,7 @@ export const visibilitySmith = tgpu
 
 const VOLUMETRIC_STEPS = 10;
 
-export interface ShadeConfig {
-  readonly lightCount: number;
-}
-
-export function makeShade(_cfg: ShadeConfig) {
+export function makeShade() {
   const fn = tgpu.computeFn({
     in: { gid: d.builtin.globalInvocationId },
     workgroupSize: [8, 8],
@@ -363,7 +359,7 @@ export function makeShade(_cfg: ShadeConfig) {
 
       let scattering = d.vec3f();
 
-      for (const li of tgpu.unroll(std.range(8))) {
+      for (const li of tgpu.unroll(std.range(MAX_LIGHTS))) {
         const light = P.lights[li];
         const intensity = light.color.w;
         if (intensity > 0) {
@@ -433,11 +429,16 @@ export function makeShade(_cfg: ShadeConfig) {
           }
 
           // --- volumetric scattering ---------------------------------------
+          // The scattering coefficient is the fog density: a denser medium both
+          // attenuates more and scatters more, so the two share one control.
           if (P.params.toggles.z > 0 && kind < 1.5) {
-            const stepLength = z / VOLUMETRIC_STEPS;
+            // March the actual view ray, whose length is |position|, not z.
+            const rayLength = std.length(position);
+            const rayDir = std.div(position, std.max(rayLength, 1e-5));
+            const stepLength = rayLength / VOLUMETRIC_STEPS;
             for (const s of tgpu.unroll(std.range(VOLUMETRIC_STEPS))) {
-              const t = ((d.f32(s) + jitter) / VOLUMETRIC_STEPS) * z;
-              const samplePos = std.mul(-t, std.neg(std.normalize(position)));
+              const t = ((d.f32(s) + jitter) / VOLUMETRIC_STEPS) * rayLength;
+              const samplePos = std.mul(t, rayDir);
               const toL = std.sub(
                 d.vec3f(light.position.x, light.position.y, light.position.z),
                 samplePos,

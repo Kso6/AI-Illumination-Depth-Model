@@ -221,6 +221,14 @@ def make_network_input(
 ) -> Tensor:
     """sRGB image -> the 4-channel tensor the network's stem consumes.
 
+    This is the batched, per-sample-exposure form of
+    :func:`illumina.model.preprocess`, which is the canonical port of
+    ``refPreprocess`` and the one ``tools/export/verify_parity.py`` checks
+    against the TypeScript reference. The two compute the same function; this
+    one additionally accepts a vector of exposures so a batch can carry a
+    different exposure per image, which is what the exposure augmentation
+    needs and what a scalar-only signature cannot express.
+
     Args:
         rgb_srgb: ``(3, H, W)`` or ``(N, 3, H, W)``, sRGB-encoded, in [0, 1].
         exposure: scalar, or a ``(N,)`` tensor of per-sample multipliers
@@ -1094,7 +1102,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
         default="depth-anything-v2-small",
         help="teacher: depth-anything-v2-small | hf:<model-id> | synthetic",
     )
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument(
         "--dtype",
         default="fp16",
