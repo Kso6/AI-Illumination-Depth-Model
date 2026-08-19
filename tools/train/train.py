@@ -78,6 +78,7 @@ import copy
 import inspect
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -321,6 +322,9 @@ def set_seed(seed: int, deterministic: bool) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if deterministic:
+        # cuBLAS needs this set before the first handle is created, or the
+        # deterministic GEMM path raises at the first matmul instead of here.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=True)
     else:
@@ -649,8 +653,13 @@ def resolve_target(
             "(with --precompute) or a working --teacher"
         )
     clean = batch["teacher_rgb"].to(device, non_blocking=True)
-    with torch.inference_mode():
-        return teacher(clean).clone()
+    disparity = teacher(clean)
+    # The teacher runs under torch.inference_mode, and an inference tensor
+    # cannot take part in an autograd graph ("Inference tensors cannot be saved
+    # for backward"). Cloning it *outside* that context is the documented way
+    # back to an ordinary tensor, and it must happen here rather than inside
+    # the teacher, where the clone would still be an inference tensor.
+    return disparity.clone().detach()
 
 
 # ---------------------------------------------------------------------------
@@ -857,23 +866,31 @@ def print_cost_estimate(
 # ---------------------------------------------------------------------------
 
 
-def make_loaders(
-    args: argparse.Namespace,
-    cache: TeacherCache | None,
-) -> tuple[DataLoader, DataLoader | None, int, int]:
-    """Builds the train and validation loaders."""
+def collect_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
+    """Resolves the train and validation image lists.
+
+    Done once, before anything expensive, so the cost estimate quotes the real
+    counts and a large image root is walked a single time.
+    """
     paths = find_images(args.data_root)
     if args.limit_images:
         paths = paths[: args.limit_images]
 
     if args.val_root:
-        train_paths = paths
         val_paths = find_images(args.val_root)
         if args.limit_images:
             val_paths = val_paths[: max(1, args.limit_images // 10)]
-    else:
-        train_paths, val_paths = split_paths(paths, args.val_fraction, args.seed)
+        return paths, val_paths
+    return split_paths(paths, args.val_fraction, args.seed)
 
+
+def make_loaders(
+    args: argparse.Namespace,
+    cache: TeacherCache | None,
+    train_paths: Sequence[Path],
+    val_paths: Sequence[Path],
+) -> tuple[DataLoader, DataLoader | None]:
+    """Builds the train and validation loaders."""
     train_aug = AugmentConfig(
         scale=(args.scale_min, args.scale_max),
         hflip_prob=args.hflip_prob,
@@ -895,7 +912,7 @@ def make_loaders(
         DistillationDataset(
             val_paths,
             size=args.input_size,
-            augment=AugmentConfig.none(),
+            augment=AugmentConfig.deterministic(),
             cache=cache,
             deterministic=True,
             seed=args.seed,
@@ -920,7 +937,7 @@ def make_loaders(
         if val_set is not None
         else None
     )
-    return train_loader, val_loader, len(train_paths), len(val_paths)
+    return train_loader, val_loader
 
 
 def append_log(path: Path, record: dict[str, Any]) -> None:
@@ -956,23 +973,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             else (args.teacher[3:] if args.teacher.startswith("hf:") else None)
         )
         if resolved is None:
-            from illumina.data import DEFAULT_TEACHER_ID
-
             resolved = DEFAULT_TEACHER_ID
         teacher_name = resolved
         cache = TeacherCache(args.teacher_cache, resolved, args.teacher_max_side)
 
-    all_paths = find_images(args.data_root)
-    if args.limit_images:
-        all_paths = all_paths[: args.limit_images]
+    train_paths, val_paths = collect_paths(args)
+    all_paths = list(train_paths) + list(val_paths)
     missing = 0
     if cache is not None:
         missing = sum(1 for p in all_paths if not cache.has(p))
 
     print_cost_estimate(
         args,
-        n_train=len(all_paths),
-        n_val=0,
+        n_train=len(train_paths),
+        n_val=len(val_paths),
         cached=cache is not None,
         missing_cache=missing,
     )
@@ -1008,8 +1022,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         teacher_name = teacher.name
 
     # --- data --------------------------------------------------------------
-    train_loader, val_loader, n_train, n_val = make_loaders(args, cache)
-    print(f"data: {n_train:,} train / {n_val:,} val images")
+    train_loader, val_loader = make_loaders(args, cache, train_paths, val_paths)
+    print(f"data: {len(train_paths):,} train / {len(val_paths):,} val images")
 
     # --- model -------------------------------------------------------------
     model = build_model(input_size=args.input_size, with_bn=True).to(device)

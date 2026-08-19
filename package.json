@@ -11,10 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "wgsl:dump": "vite-node scripts/dump-wgsl.ts",
-    "wgsl:validate": "vite-node scripts/dump-wgsl.ts && node scripts/validate-wgsl.mjs",
-    "bench": "vite-node scripts/bench.ts",
-    "weights:synth": "vite-node scripts/make-weights.ts"
+    "arch": "vite-node scripts/arch-report.ts"
   },
   "dependencies": {
     "typegpu": "0.12.0"
@@ -29,5 +26,6 @@
     "vite": "^6.0.7",
     "vite-node": "^3.0.0",
     "vitest": "^3.0.0"
-  }
+  },
+  "license": "MIT"
 }
