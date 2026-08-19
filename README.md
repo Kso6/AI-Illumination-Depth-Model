@@ -99,7 +99,12 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-Requires a browser with WebGPU: Chrome/Edge 113+, or Safari 18+.
+Requires Node 20+ and a browser with WebGPU: Chrome/Edge 113+, or Safari 18+.
+
+The test-suite's headless WebGPU implementation (`@kmamal/gpu`) is a native
+addon and is listed as an *optional* dependency, so `npm install` still succeeds
+where no prebuilt binary exists. The application never uses it; only `npm test`
+does.
 
 ```bash
 npm run build        # typecheck + production bundle

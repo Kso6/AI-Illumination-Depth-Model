@@ -37,7 +37,22 @@ let cached: HeadlessGpu | undefined;
 export async function headlessGpu(): Promise<HeadlessGpu> {
   if (cached) return cached;
 
-  const mod = (await import('@kmamal/gpu')).default as unknown as DawnModule;
+  // Imported through a variable so TypeScript treats the specifier as dynamic.
+  // `@kmamal/gpu` ships a native addon and is an *optional* dependency: the app
+  // itself never needs it, and a machine where the prebuilt binary is
+  // unavailable must still be able to `npm install`, build and run.
+  const specifier = '@kmamal/gpu';
+  let mod: DawnModule;
+  try {
+    mod = ((await import(/* @vite-ignore */ specifier)) as { default: unknown })
+      .default as DawnModule;
+  } catch (err) {
+    throw new Error(
+      'headlessGpu: @kmamal/gpu is not installed, so the GPU test-suite cannot ' +
+        `run (${(err as Error).message}). Install it with \`npm i -D @kmamal/gpu\`, ` +
+        'or skip these tests — the application does not depend on it.',
+    );
+  }
   // TypeGPU reads these as ambient globals when building descriptors.
   for (const key of WEBGPU_GLOBALS) {
     if (!(key in globalThis)) {
