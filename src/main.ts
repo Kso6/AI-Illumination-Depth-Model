@@ -23,6 +23,7 @@ import { createSceneSource, type SceneSource, type SourceMode } from './scene/so
 import { renderFrame } from './engine/frame.ts';
 import { GpuProfiler } from './engine/timing.ts';
 import { evaluateDepth, type DepthMetrics } from './scene/metrics.ts';
+import { backBufferSize } from './ui/layout.ts';
 import { buildPanel, type ControlGroup } from './ui/controls.ts';
 
 const NETWORK_SIZE = ILLUMINA_DEPTH_448.inputSize;
@@ -165,12 +166,14 @@ async function main(): Promise<void> {
     maxFps: 60,
   };
 
-  const sized = () => {
-    const scale = state.renderScale;
-    const w = Math.max(1, Math.round(canvas.clientWidth * scale));
-    const h = Math.max(1, Math.round(canvas.clientHeight * scale));
-    return { w, h };
-  };
+  const sized = () =>
+    backBufferSize(
+      canvas.clientWidth,
+      canvas.clientHeight,
+      window.innerWidth,
+      window.innerHeight,
+      state.renderScale,
+    );
   let { w, h } = sized();
   canvas.width = w;
   canvas.height = h;
@@ -210,8 +213,23 @@ async function main(): Promise<void> {
     fail('Missing UI elements');
   }
 
-  statusEl.textContent = note;
+  /**
+   * The status line carries two independent things: whether real weights were
+   * found, which never changes, and what the source is doing, which changes
+   * often. Writing the second over the first hid the "these weights are
+   * untrained" warning the moment anyone touched the source dropdown — so both
+   * are shown, and the whole line is rebuilt from state rather than poked at
+   * from event handlers.
+   */
+  let lastStatus = '';
+  const showStatus = () => {
+    const text = trained ? source.label : `${source.label}\n\n${note}`;
+    if (text === lastStatus) return;
+    lastStatus = text;
+    statusEl.textContent = text;
+  };
   statusEl.classList.toggle('warn', !trained);
+  showStatus();
 
   const cost = costOf(ILLUMINA_DEPTH_448);
   let metrics: DepthMetrics | undefined;
@@ -262,9 +280,7 @@ async function main(): Promise<void> {
           options: ['procedural', 'camera', 'image'] as const,
           get: () => source.mode,
           set: (v) => {
-            void source.setMode(v as SourceMode).then(() => {
-              statusEl.textContent = source.label;
-            });
+            void source.setMode(v as SourceMode).then(showStatus);
           },
         },
         {
@@ -285,7 +301,7 @@ async function main(): Promise<void> {
               if (!file) return;
               const bitmap = await createImageBitmap(file);
               source.loadImage(bitmap);
-              statusEl.textContent = source.label;
+              showStatus();
               bitmap.close();
             });
             input.click();
@@ -487,6 +503,7 @@ async function main(): Promise<void> {
     frame++;
 
     if ((frame & 7) === 0) {
+      showStatus();
       const gpu = profiler.latest;
       const gpuLines = gpu.length
         ? gpu.map((t) => `  ${t.label.padEnd(18)} ${t.ms.toFixed(2)} ms`).join('\n')
@@ -505,7 +522,8 @@ async function main(): Promise<void> {
         `encoders     ${result.encoders}   submits ${result.submits}`,
         `activations  ${(model.stats.arenaBytes / 1e6).toFixed(1)} MB ` +
           `(${(model.stats.naiveArenaBytes / 1e6).toFixed(1)} MB unaliased)`,
-        `weights      ${(model.stats.weightBytes / 1e6).toFixed(2)} MB`,
+        `weights      ${(model.stats.weightBytes / 1e6).toFixed(2)} MB` +
+          (trained ? '' : '   ** UNTRAINED (random init) **'),
         '',
         'GPU time',
         gpuLines,

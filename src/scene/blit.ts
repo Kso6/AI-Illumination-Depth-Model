@@ -79,12 +79,16 @@ export function cropTransform(width: number, height: number): [number, number, n
   return [scaleX, scaleY, (1 - scaleX) / 2, (1 - scaleY) / 2];
 }
 
+/** Which import path the last upload used, for the diagnostics panel. */
+export type CopyPath = 'none' | 'direct' | 'canvas';
+
 export interface Blitter {
   /** Uploads a frame at its native size, recreating the staging texture on resize. */
   upload(source: GPUCopyExternalImageSource, width: number, height: number, mirror: boolean): void;
   record(pass: TgpuRenderPass): void;
   /** True once at least one frame has been uploaded. */
   readonly ready: boolean;
+  readonly copyPath: CopyPath;
   destroy(): void;
 }
 
@@ -118,11 +122,37 @@ export function createBlitter(
   let lastMirror: boolean | undefined;
   /** Set when a uniform write failed, so the next frame retries it. */
   let transformDirty = true;
+  let copyPath: CopyPath = 'none';
 
   function createStaging(w: number, h: number) {
     return root
       .createTexture({ size: [w, h], format: colorFormat })
       .$usage('sampled', 'render');
+  }
+
+  /**
+   * Not every browser accepts every source type in
+   * `copyExternalImageToTexture`; an `HTMLVideoElement` in particular is
+   * accepted by Chrome but has been rejected by other implementations, which
+   * prefer `importExternalTexture`. Drawing through a 2-D canvas costs one
+   * extra copy but is accepted everywhere, so it is kept as a fallback rather
+   * than making the camera simply not work.
+   */
+  let scratch: HTMLCanvasElement | undefined;
+  let scratchCtx: CanvasRenderingContext2D | null = null;
+
+  function copyViaCanvas(source: GPUCopyExternalImageSource, w: number, h: number, texture: GPUTexture) {
+    if (!scratch) {
+      scratch = document.createElement('canvas');
+      scratchCtx = scratch.getContext('2d');
+    }
+    if (!scratch || !scratchCtx) throw new Error('no 2-D canvas to fall back to');
+    if (scratch.width !== w || scratch.height !== h) {
+      scratch.width = w;
+      scratch.height = h;
+    }
+    scratchCtx.drawImage(source as CanvasImageSource, 0, 0, w, h);
+    root.device.queue.copyExternalImageToTexture({ source: scratch }, { texture }, { width: w, height: h });
   }
 
   return {
@@ -160,11 +190,20 @@ export function createBlitter(
           transformDirty = true;
         }
       }
-      root.device.queue.copyExternalImageToTexture(
-        { source },
-        { texture: root.unwrap(staging) },
-        { width, height },
-      );
+      const texture = root.unwrap(staging);
+      if (copyPath !== 'canvas') {
+        try {
+          root.device.queue.copyExternalImageToTexture({ source }, { texture }, { width, height });
+          copyPath = 'direct';
+        } catch {
+          // Latched, so the direct path is not re-attempted every frame once it
+          // is known to be unsupported here.
+          copyPath = 'canvas';
+          copyViaCanvas(source, width, height, texture);
+        }
+      } else {
+        copyViaCanvas(source, width, height, texture);
+      }
       ready = true;
     },
 
@@ -177,9 +216,15 @@ export function createBlitter(
       return ready;
     },
 
+    get copyPath() {
+      return copyPath;
+    },
+
     destroy() {
       staging?.destroy();
       staging = undefined;
+      scratch = undefined;
+      scratchCtx = null;
       ready = false;
     },
   };

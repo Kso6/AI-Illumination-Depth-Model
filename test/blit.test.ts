@@ -15,7 +15,14 @@ import { describe, expect, it } from 'vitest';
 import tgpu from 'typegpu';
 import * as d from 'typegpu/data';
 import { headlessGpu, readBuffer } from './helpers/gpu.ts';
-import { BlitParams, blitFragment, blitLayout, blitVertex, cropTransform } from '../src/scene/blit.ts';
+import {
+  BlitParams,
+  blitFragment,
+  blitLayout,
+  blitVertex,
+  createBlitter,
+  cropTransform,
+} from '../src/scene/blit.ts';
 
 const OUT = 64;
 const SRC_W = 320;
@@ -208,5 +215,77 @@ describe('blit framing', () => {
     expect(plain.right).toBeGreaterThan(180);
     expect(mirrored.left).toBeGreaterThan(180);
     expect(mirrored.right).toBeLessThan(80);
+  });
+});
+
+/**
+ * Not every browser accepts an `HTMLVideoElement` in
+ * `copyExternalImageToTexture`. When it is refused the camera must keep
+ * working through a 2-D canvas rather than going black, and — since the refusal
+ * is permanent for that browser — the failing path must not be retried on every
+ * frame.
+ */
+describe('external image import fallback', () => {
+  it('latches onto the canvas path after one refusal and stops retrying', async () => {
+    const { root } = await headlessGpu();
+    const queue = root.device.queue;
+    const original = queue.copyExternalImageToTexture.bind(queue);
+
+    const fakeCtx = { drawImage: () => {} };
+    let created = 0;
+    const fakeCanvas = { width: 0, height: 0, getContext: () => fakeCtx };
+    const previousDocument = (globalThis as Record<string, unknown>)['document'];
+    (globalThis as Record<string, unknown>)['document'] = {
+      createElement: (tag: string) => {
+        if (tag !== 'canvas') throw new Error(`unexpected element ${tag}`);
+        created++;
+        return fakeCanvas;
+      },
+    };
+
+    const attempts: string[] = [];
+    try {
+      Object.defineProperty(queue, 'copyExternalImageToTexture', {
+        configurable: true,
+        writable: true,
+        value: (src: { source: unknown }) => {
+          const viaCanvas = src.source === fakeCanvas;
+          attempts.push(viaCanvas ? 'canvas' : 'direct');
+          // Stands in for a browser that refuses the source type outright.
+          if (!viaCanvas) throw new TypeError('unsupported source type');
+        },
+      });
+
+      const blitter = createBlitter(root, 'rgba8unorm', 'rgba16float');
+      expect(blitter.copyPath).toBe('none');
+
+      const video = { nodeName: 'VIDEO' } as unknown as GPUCopyExternalImageSource;
+      blitter.upload(video, 640, 480, true);
+      expect(blitter.copyPath).toBe('canvas');
+      expect(blitter.ready).toBe(true);
+      // The scratch canvas is resized to the source, not the destination: the
+      // scaling is the blit shader's job.
+      expect([fakeCanvas.width, fakeCanvas.height]).toEqual([640, 480]);
+
+      blitter.upload(video, 640, 480, true);
+      blitter.upload(video, 640, 480, true);
+
+      // One refused attempt, then only the working path.
+      expect(attempts).toEqual(['direct', 'canvas', 'canvas', 'canvas']);
+      // And exactly one scratch canvas for the whole session.
+      expect(created).toBe(1);
+      blitter.destroy();
+    } finally {
+      Object.defineProperty(queue, 'copyExternalImageToTexture', {
+        configurable: true,
+        writable: true,
+        value: original,
+      });
+      if (previousDocument === undefined) {
+        delete (globalThis as Record<string, unknown>)['document'];
+      } else {
+        (globalThis as Record<string, unknown>)['document'] = previousDocument;
+      }
+    }
   });
 });
