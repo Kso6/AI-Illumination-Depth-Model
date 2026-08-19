@@ -115,10 +115,17 @@ export interface DepthModel {
   /** Advances the temporal history ping-pong. Call once per frame after record. */
   swapHistory(): void;
   /**
-   * Index of the depth texture `record()` writes this frame, for callers that
+   * Index of the depth texture the next `record()` will write, for callers that
    * hold per-parity bind groups over the same ping-pong pair.
    */
   outputParity(): number;
+  /**
+   * Index of the texture holding the most recent result. This is *not* always
+   * `outputParity()`: after `swapHistory()` the two differ, and a caller that
+   * skipped inference this frame must shade from the last thing actually
+   * written, not from the slot that is about to be overwritten.
+   */
+  freshParity(): number;
   /** Both depth ping-pong textures, so a consumer can build per-parity bind groups. */
   debugDepth(index: number): WorkTexture;
   setExposure(exposure: number): void;
@@ -164,6 +171,8 @@ export function createDepthModel(root: TgpuRoot, options: DepthModelOptions): De
     createWorkTexture(root, size),
   ];
   let historyIndex = 0;
+  /** Slot most recently written by `record()`. */
+  let lastWritten = 1;
 
   const sampler = root.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
@@ -427,8 +436,9 @@ export function createDepthModel(root: TgpuRoot, options: DepthModelOptions): De
   return {
     arch,
     sceneColor,
-    currentDepth: () => depth[1 - historyIndex]!,
+    currentDepth: () => depth[lastWritten]!,
     record(pass: TgpuComputePass) {
+      lastWritten = 1 - historyIndex;
       for (const s of steps) {
         s.pipeline.with(s.group).with(pass).dispatchWorkgroups(...s.dispatch);
       }
@@ -441,6 +451,7 @@ export function createDepthModel(root: TgpuRoot, options: DepthModelOptions): De
       historyIndex = 1 - historyIndex;
     },
     outputParity: () => 1 - historyIndex,
+    freshParity: () => lastWritten,
     debugDepth: (index: number) => depth[index === 0 ? 0 : 1],
     setExposure(exposure: number) {
       preprocessParams.writePartial({

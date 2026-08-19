@@ -301,3 +301,52 @@ describe('procedural scene through the whole pipeline', () => {
     renderer.destroy();
   });
 });
+
+describe('skipping inference on unchanged input', () => {
+  it('records one dispatch and shades from the last depth actually written', async () => {
+    const { root } = await headlessGpu();
+    const arch = buildArchitecture(SIZE);
+    const source = uploadImage(root, SIZE, scene(SIZE));
+    const model = createDepthModel(root, {
+      arch,
+      weights: synthesizeWeights(arch, 606),
+      source,
+    });
+    const renderer = createRenderer(root, {
+      width: OUT,
+      height: OUT,
+      depthSize: SIZE,
+      albedo: source,
+      depthTextures: [model.debugDepth(0), model.debugDepth(1)],
+      presentFormat: FORMAT,
+    });
+    renderer.setLights(KEY_LIGHT);
+    renderer.update(DEFAULT_SETTINGS, 0);
+
+    const target = root.createTexture({ size: [OUT, OUT], format: FORMAT }).$usage('render');
+    const view = target.createView('render');
+
+    // One real frame, so there is a depth map to reuse.
+    const full = renderFrame({ root, model, renderer, target: view });
+    expect(full.dispatches).toBe(41);
+    const lit = await readTarget(root, target);
+
+    // The ping-pong has now advanced, so a naive `outputParity()` would point at
+    // the *stale* slot; the skipped frame must shade from `freshParity()`.
+    const fresh = model.freshParity();
+    const skipped = renderFrame({ root, model, renderer, target: view, skipInference: true });
+    expect(skipped.dispatches).toBe(1);
+    // Skipping must not advance the ping-pong.
+    expect(model.freshParity()).toBe(fresh);
+
+    const again = await readTarget(root, target);
+    // Same depth, same lights, same settings: the image must be identical, which
+    // it would not be if the skipped frame had shaded from the other slot.
+    let differing = 0;
+    for (let i = 0; i < lit.length; i++) if (lit[i] !== again[i]) differing++;
+    expect(differing).toBe(0);
+
+    model.destroy();
+    renderer.destroy();
+  });
+});

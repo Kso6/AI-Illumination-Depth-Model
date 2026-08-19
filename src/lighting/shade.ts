@@ -358,11 +358,17 @@ export function makeShade() {
       const nDotV = std.max(std.dot(normal, viewDir), 1e-4);
       const roughness = std.clamp(P.params.misc.y, 0.04, 1);
 
-      const ao = std.mix(
-        1,
-        horizonOcclusion(dcoord, position, normal, P.params.debug.w, jitter),
-        P.params.toggles.x,
-      );
+      // `std.mix` would evaluate the occlusion term regardless of its weight,
+      // so at strength zero the kernel still paid for twenty-four position
+      // reconstructions and their texture loads. Branch instead.
+      let ao = d.f32(1);
+      if (P.params.toggles.x > 0.001) {
+        ao = std.mix(
+          1,
+          horizonOcclusion(dcoord, position, normal, P.params.debug.w, jitter),
+          P.params.toggles.x,
+        );
+      }
 
       let radiance = std.mul(
         std.mul(P.params.ambient.w * ao, albedo),

@@ -45,6 +45,14 @@ export interface FrameOptions {
    */
   readonly target: ColorAttachment['view'];
   readonly scene?: ScenePass | undefined;
+  /**
+   * Skip the network and shade from the previous frame's depth.
+   *
+   * A still image produces identical depth every frame, so re-running forty
+   * dispatches on it is pure heat. The lighting still runs, because the lights
+   * move even when the subject does not.
+   */
+  readonly skipInference?: boolean;
   readonly profiler?: GpuProfiler | undefined;
   /** Split into per-stage passes so timestamps can attribute time. */
   readonly profile?: boolean;
@@ -70,7 +78,16 @@ export interface FrameResult {
  * single submit at the end.
  */
 export function renderFrame(options: FrameOptions): FrameResult {
-  const { root, model, renderer, target, scene, profiler, profile = false } = options;
+  const {
+    root,
+    model,
+    renderer,
+    target,
+    scene,
+    profiler,
+    profile = false,
+    skipInference = false,
+  } = options;
 
   profiler?.beginFrame();
 
@@ -88,19 +105,21 @@ export function renderFrame(options: FrameOptions): FrameResult {
     scenePass.end();
   }
 
-  const parity = model.outputParity();
+  const parity = skipInference ? model.freshParity() : model.outputParity();
 
-  const dispatches = model.stats.dispatches + 1;
+  const dispatches = skipInference ? 1 : model.stats.dispatches + 1;
 
   if (profile) {
     // Two passes so the boundary between them can be timestamped. The extra
     // pass boundary is the price of attribution.
-    const inferencePass = encoder.beginComputePass({
-      label: 'inference',
-      timestampWrites: profiler?.span('inference'),
-    });
-    model.record(inferencePass);
-    inferencePass.end();
+    if (!skipInference) {
+      const inferencePass = encoder.beginComputePass({
+        label: 'inference',
+        timestampWrites: profiler?.span('inference'),
+      });
+      model.record(inferencePass);
+      inferencePass.end();
+    }
 
     const shadePass = encoder.beginComputePass({
       label: 'shading',
@@ -110,10 +129,10 @@ export function renderFrame(options: FrameOptions): FrameResult {
     shadePass.end();
   } else {
     const pass = encoder.beginComputePass({
-      label: 'inference+shading',
-      timestampWrites: profiler?.span('inference+shading'),
+      label: skipInference ? 'shading' : 'inference+shading',
+      timestampWrites: profiler?.span(skipInference ? 'shading' : 'inference+shading'),
     });
-    model.record(pass);
+    if (!skipInference) model.record(pass);
     renderer.recordShade(pass, parity);
     pass.end();
   }
@@ -141,7 +160,8 @@ export function renderFrame(options: FrameOptions): FrameResult {
 
   encoder.submit();
   profiler?.afterSubmit();
-  model.swapHistory();
+  // Only advance the ping-pong when something was actually written into it.
+  if (!skipInference) model.swapHistory();
 
   return { dispatches, draws: scene ? 2 : 1, encoders: 1, submits: 1 };
 }

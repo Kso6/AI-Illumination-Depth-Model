@@ -30,7 +30,7 @@ submit ×1
 | Activation memory | **19.0 MB** with arena aliasing (63.1 MB without) |
 | Weight memory | 5.56 MB at fp32 |
 | Authoring | TypeScript kernels (`'use gpu'`) transpiled to WGSL by TypeGPU 0.12 |
-| Verification | 79 tests executing real WGSL on a real WebGPU device |
+| Verification | 86 tests executing real WGSL on a real WebGPU device |
 
 Everything in that table is measured, not estimated: run `npm run arch` for the
 layer table and open the app for the live counters.
@@ -71,6 +71,46 @@ anywhere in this project.
 
 ---
 
+## Power and heat
+
+The network is not what makes a laptop warm — the **shading pass** is. It does on
+the order of ninety texture fetches per pixel (ambient-occlusion horizon marches,
+contact-shadow marches, volumetric steps), so its cost scales with the *square*
+of the render resolution.
+
+Two defaults used to make that far worse than it needed to be, and both are
+fixed:
+
+* **Render scale is 1.0, not `devicePixelRatio`.** On a Retina display a 2×
+  backing store means four times the shaded pixels for a difference most of this
+  effect budget cannot show. Raise it with *Performance → Render scale* if you
+  want the extra sharpness.
+* **Frame rate is capped at 60.** A ProMotion display drives
+  `requestAnimationFrame` at 120 Hz, doubling the work again for motion nobody
+  asked for.
+
+Together those two are roughly an **8× reduction** in shading work on a Retina
+ProMotion Mac compared with the naive defaults.
+
+Three more savings apply automatically:
+
+* Ambient occlusion is skipped entirely when its strength is zero. It used to be
+  blended with `mix`, which evaluates both arms — so a disabled effect still paid
+  for twenty-four position reconstructions per pixel.
+* A **still image skips inference altogether**: identical input produces identical
+  depth, so re-running forty dispatches on it every frame is pure heat. The HUD
+  shows `dispatches 1 (inference skipped: source unchanged)`. Lighting still runs,
+  because the lights move even when the subject does not.
+* The camera is requested at 640×480 rather than 720p. The network consumes
+  448×448, so a larger feed is wasted decode, bus traffic and texture memory.
+
+*Performance → Quality* sets all of these together (`battery` / `balanced` /
+`high`). `battery` keeps the depth-aware lighting fully intact — normals, direct
+light, contact shadows, occlusion — and drops only the volumetric marching, which
+costs the most per unit of visible difference.
+
+---
+
 ## Weights
 
 **The weights shipped with this repository are untrained.** There is no
@@ -108,7 +148,7 @@ does.
 
 ```bash
 npm run build        # typecheck + production bundle
-npm test             # 79 tests on a real GPU (see "Testing" below)
+npm test             # 86 tests on a real GPU (see "Testing" below)
 npm run arch         # print the layer table, FLOP and parameter budget
 ```
 

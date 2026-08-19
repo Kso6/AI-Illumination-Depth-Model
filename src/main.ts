@@ -75,6 +75,19 @@ interface AppState {
   profile: boolean;
   paused: boolean;
   lightMotion: number;
+  /**
+   * Backing-store resolution as a multiple of CSS pixels.
+   *
+   * This is the single biggest power lever in the whole application. The
+   * shading kernel does on the order of ninety texture fetches per pixel — AO
+   * horizon marches, contact-shadow marches and volumetric steps — so its cost
+   * scales with the square of this number. Defaulting to 2 on a Retina display
+   * (as `devicePixelRatio` would) quadruples that work relative to 1, which on
+   * a laptop is the difference between warm and hot.
+   */
+  renderScale: number;
+  /** Frames per second to target. ProMotion displays otherwise run at 120. */
+  maxFps: number;
 }
 
 async function main(): Promise<void> {
@@ -148,12 +161,14 @@ async function main(): Promise<void> {
     profile: false,
     paused: false,
     lightMotion: 0.5,
+    renderScale: 1,
+    maxFps: 60,
   };
 
   const sized = () => {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const scale = state.renderScale;
+    const w = Math.max(1, Math.round(canvas.clientWidth * scale));
+    const h = Math.max(1, Math.round(canvas.clientHeight * scale));
     return { w, h };
   };
   let { w, h } = sized();
@@ -203,6 +218,40 @@ async function main(): Promise<void> {
   let evaluating = false;
 
   const s = state.settings;
+
+  /**
+   * Quality presets.
+   *
+   * The shading kernel's cost is dominated by three ray-marched effects and
+   * scales with the square of the render scale, so these presets move exactly
+   * those knobs. `battery` keeps the depth-aware lighting fully intact — normals,
+   * direct light, contact shadows and occlusion — and drops only the volumetric
+   * marching, which is the most expensive effect per unit of visible difference.
+   */
+  type Quality = 'battery' | 'balanced' | 'high';
+  let quality: Quality = 'balanced';
+  const applyQuality = (q: Quality) => {
+    quality = q;
+    if (q === 'battery') {
+      state.renderScale = 0.75;
+      state.maxFps = 30;
+      s.volumetric = 0;
+      s.aoRadiusPixels = 8;
+    } else if (q === 'balanced') {
+      state.renderScale = 1;
+      state.maxFps = 60;
+      s.volumetric = 0.2;
+      s.aoRadiusPixels = 14;
+    } else {
+      state.renderScale = 1.5;
+      state.maxFps = 120;
+      s.volumetric = 0.5;
+      s.aoRadiusPixels = 22;
+    }
+    refresh?.();
+  };
+  let refresh: (() => void) | undefined;
+
   const groups: ControlGroup[] = [
     {
       title: 'Source',
@@ -293,6 +342,35 @@ async function main(): Promise<void> {
       ],
     },
     {
+      title: 'Performance',
+      controls: [
+        {
+          kind: 'select',
+          label: 'Quality',
+          options: ['battery', 'balanced', 'high'] as const,
+          get: () => quality,
+          set: (v) => applyQuality(v as Quality),
+        },
+        {
+          kind: 'slider',
+          label: 'Render scale',
+          min: 0.5,
+          max: 2,
+          step: 0.05,
+          get: () => state.renderScale,
+          set: (v) => (state.renderScale = v),
+          format: (v) => `${v.toFixed(2)}×`,
+        },
+        {
+          kind: 'select',
+          label: 'Max FPS',
+          options: ['30', '60', '120', 'uncapped'] as const,
+          get: () => (state.maxFps === 0 ? 'uncapped' : String(state.maxFps)),
+          set: (v) => (state.maxFps = v === 'uncapped' ? 0 : Number(v)),
+        },
+      ],
+    },
+    {
       title: 'Diagnostics',
       collapsed: true,
       controls: [
@@ -335,7 +413,8 @@ async function main(): Promise<void> {
       ],
     },
   ];
-  buildPanel(panelEl, groups);
+  refresh = buildPanel(panelEl, groups);
+  applyQuality('balanced');
 
   // --- frame loop ---------------------------------------------------------
   let frame = 0;
@@ -347,6 +426,12 @@ async function main(): Promise<void> {
     requestAnimationFrame(loop);
 
     const now = performance.now();
+    // Frame-rate cap. A ProMotion display drives `requestAnimationFrame` at
+    // 120 Hz, which doubles the GPU work for motion nobody asked for. Bail out
+    // *before* touching `last`, so the skipped callback does not count as a
+    // frame and the interval stays honest.
+    if (state.maxFps > 0 && now - last < 1000 / state.maxFps - 0.5) return;
+
     const dt = now - last;
     last = now;
     smoothedFrameMs += (dt - smoothedFrameMs) * 0.08;
@@ -390,9 +475,13 @@ async function main(): Promise<void> {
       model,
       renderer,
       target: context,
-      scene: source.needsScenePass ? scenePass : undefined,
+      scene: scenePass,
       profiler,
       profile: state.profile,
+      // A still image yields identical depth every frame; re-running forty
+      // dispatches on it is pure heat. The lighting still runs, because the
+      // lights move even when the subject does not.
+      skipInference: !source.changed,
     });
 
     frame++;
@@ -406,10 +495,12 @@ async function main(): Promise<void> {
         `${(1000 / smoothedFrameMs).toFixed(0)} fps   ${smoothedFrameMs.toFixed(1)} ms/frame`,
         '',
         `network      ${ILLUMINA_DEPTH_448.name}`,
-        `resolution   ${NETWORK_SIZE}×${NETWORK_SIZE} → ${w}×${h}`,
+        `resolution   ${NETWORK_SIZE}×${NETWORK_SIZE} → ${w}×${h}  (scale ${state.renderScale}×)`,
         `parameters   ${(cost.totalParams / 1e6).toFixed(2)} M`,
         `work         ${(cost.totalMacs * 2e-9).toFixed(2)} GFLOP / frame`,
-        `dispatches   ${result.dispatches}  (${cost.dispatches} inference + 1 shading)`,
+        result.dispatches > 1
+          ? `dispatches   ${result.dispatches}  (${cost.dispatches} inference + 1 shading)`
+          : `dispatches   1  (inference skipped: source unchanged)`,
         `draws        ${result.draws}`,
         `encoders     ${result.encoders}   submits ${result.submits}`,
         `activations  ${(model.stats.arenaBytes / 1e6).toFixed(1)} MB ` +
