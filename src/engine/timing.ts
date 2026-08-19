@@ -18,31 +18,48 @@ export interface TimingSpan {
   readonly ms: number;
 }
 
+/**
+ * A staging slot's lifecycle.
+ *
+ * This must be a single explicit state rather than a pair of booleans. An
+ * earlier version tracked only `pending`, which let two failure modes through:
+ * a slot that was still recorded-but-not-yet-mapped could be mapped twice, and
+ * because a duplicate `mapAsync` on an already-mapping buffer rejects
+ * *immediately*, the rejection handler cleared the flag while the first mapping
+ * was still outstanding. The next frame to reach that slot then recorded a copy
+ * into a buffer WebGPU considered mapped, which is a validation error.
+ *
+ *   idle     — free; may be recorded into
+ *   recorded — a resolve+copy is in this frame's encoder; must not be re-recorded
+ *   mapping  — mapAsync is outstanding; must not be recorded into or re-mapped
+ */
+type SlotState = 'idle' | 'recorded' | 'mapping';
+
 interface Slot {
   readonly resolve: GPUBuffer;
   readonly staging: GPUBuffer;
-  mapped: boolean;
-  pending: boolean;
+  state: SlotState;
+  /** Labels captured when this slot was recorded, so results cannot desync. */
+  labels: string[];
 }
 
 const RING = 3;
 
 export class GpuProfiler {
   readonly available: boolean;
-  #device: GPUDevice;
   #querySet: GPUQuerySet | undefined;
   #slots: Slot[] = [];
   #labels: string[] = [];
   #frame = 0;
   #latest: TimingSpan[] = [];
   #capacity: number;
+  #destroyed = false;
 
   /**
    * @param spans Maximum number of nested/sequential spans per frame. Each span
    *   consumes two timestamps.
    */
   constructor(device: GPUDevice, spans = 4) {
-    this.#device = device;
     this.#capacity = spans;
     this.available =
       (device.features as unknown as ReadonlySet<string>).has('timestamp-query') ?? false;
@@ -60,8 +77,8 @@ export class GpuProfiler {
           size: spans * 2 * 8,
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         }),
-        mapped: false,
-        pending: false,
+        state: 'idle',
+        labels: [],
       });
     }
   }
@@ -90,39 +107,51 @@ export class GpuProfiler {
   /**
    * Records the query resolve into the frame's encoder. Must be called after all
    * passes are ended but before the encoder is finished.
+   *
+   * Silently skips the frame when every slot is still in flight — dropping a
+   * frame's timings is always preferable to stalling the frame loop.
    */
   resolve(encoder: GPUCommandEncoder): void {
     if (!this.available || !this.#querySet || this.#labels.length === 0) return;
     const slot = this.#slots[this.#frame % RING]!;
-    if (slot.pending) return; // Still being read; skip this frame's timing.
+    if (slot.state !== 'idle') return;
     const count = this.#labels.length * 2;
     encoder.resolveQuerySet(this.#querySet, 0, count, slot.resolve, 0);
     encoder.copyBufferToBuffer(slot.resolve, 0, slot.staging, 0, count * 8);
-    slot.pending = true;
+    // Capture the labels with the slot: by the time the map resolves, several
+    // more frames will have called `beginFrame` and replaced `this.#labels`.
+    slot.labels = [...this.#labels];
+    slot.state = 'recorded';
   }
 
   /**
-   * Call after submitting. Kicks off the asynchronous read of an older frame's
+   * Call after submitting. Kicks off the asynchronous read of this frame's
    * timings; never blocks.
    */
   afterSubmit(): void {
     if (!this.available) return;
-    const labels = [...this.#labels];
     const slot = this.#slots[this.#frame % RING]!;
     this.#frame++;
-    if (!slot.pending) return;
+    if (slot.state !== 'recorded') return;
+    slot.state = 'mapping';
 
+    const labels = slot.labels;
     void slot.staging
       .mapAsync(GPUMapMode.READ)
       .then(() => {
+        if (this.#destroyed) return;
         const raw = new BigUint64Array(slot.staging.getMappedRange().slice(0));
         const spans: TimingSpan[] = [];
         for (let i = 0; i < labels.length; i++) {
           const start = raw[i * 2]!;
           const end = raw[i * 2 + 1]!;
-          // Timestamps are nanoseconds; a zero or inverted pair means the query
-          // did not complete and should be ignored rather than reported as 0 ms.
-          if (end > start) {
+          // Timestamps are nanoseconds. A pair that is still all-zero means the
+          // query never completed; an inverted pair means it is unusable. But an
+          // *equal* pair is legitimate — a pass can genuinely take less than the
+          // timer's resolution — and dropping those would silently shorten the
+          // report and misalign it with the labels the caller opened.
+          const valid = end >= start && !(start === 0n && end === 0n);
+          if (valid) {
             spans.push({ label: labels[i]!, ms: Number(end - start) / 1e6 });
           }
         }
@@ -133,7 +162,8 @@ export class GpuProfiler {
         /* device lost or buffer destroyed — timings are best-effort */
       })
       .finally(() => {
-        slot.pending = false;
+        // Only the mapping that actually started may return the slot to `idle`.
+        if (slot.state === 'mapping') slot.state = 'idle';
       });
   }
 
@@ -147,10 +177,14 @@ export class GpuProfiler {
   }
 
   destroy(): void {
+    // Destroying a buffer with an outstanding `mapAsync` rejects that promise;
+    // the flag stops the handler from touching freed objects afterwards.
+    this.#destroyed = true;
     this.#querySet?.destroy();
     for (const s of this.#slots) {
       s.resolve.destroy();
       s.staging.destroy();
+      s.state = 'idle';
     }
     this.#slots = [];
   }
