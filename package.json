@@ -23,6 +23,7 @@
     "@kmamal/gpu": "^0.2.1",
     "@types/node": "^22.10.2",
     "@webgpu/types": "^0.1.71",
+    "playwright": "^1.62.1",
     "typescript": "^5.7.2",
     "unplugin-typegpu": "^0.12.1",
     "vite": "^6.0.7",

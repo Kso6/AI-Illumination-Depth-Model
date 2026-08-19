@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IlluminaDepth — real-time monocular depth and depth-aware lighting in TypeGPU</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/ui/style.css" />
+  </head>
+  <body>
+    <main>
+      <canvas id="viewport"></canvas>
+      <div id="boot-error" hidden></div>
+      <section id="overlay">
+        <h1>IlluminaDepth<span>448 × 448 monocular depth · TypeGPU · one command encoder</span></h1>
+        <pre id="stats">starting…</pre>
+        <pre id="metrics"></pre>
+      </section>
+    </main>
+    <aside id="sidebar">
+      <p id="status">Initialising…</p>
+      <div id="panel"></div>
+      <footer>
+        Inference, lighting and the draw are recorded into a single
+        <code>GPUCommandEncoder</code> and submitted once. The depth map never
+        leaves the GPU.
+      </footer>
+    </aside>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

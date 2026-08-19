@@ -18,10 +18,21 @@
  * queries can attribute GPU time to inference versus lighting. That costs extra
  * pass boundaries, which is exactly why it is not the default.
  */
-import type { ColorAttachment, TgpuRoot } from 'typegpu';
+import type { ColorAttachment, TgpuRenderPass, TgpuRoot } from 'typegpu';
 import type { DepthModel } from '../model/runner.ts';
 import type { Renderer } from '../lighting/renderer.ts';
 import type { GpuProfiler } from './timing.ts';
+
+/**
+ * An optional scene rendered into the source texture at the top of the frame.
+ * When present, the image the network analyses is itself produced on the GPU in
+ * this same encoder, so a frame contains no CPU-side image handling at all.
+ */
+export interface ScenePass {
+  record(pass: TgpuRenderPass): void;
+  readonly colorTarget: ColorAttachment['view'];
+  readonly truthTarget: ColorAttachment['view'];
+}
 
 export interface FrameOptions {
   readonly root: TgpuRoot;
@@ -33,6 +44,7 @@ export interface FrameOptions {
    * is not narrowed to a canvas.
    */
   readonly target: ColorAttachment['view'];
+  readonly scene?: ScenePass | undefined;
   readonly profiler?: GpuProfiler | undefined;
   /** Split into per-stage passes so timestamps can attribute time. */
   readonly profile?: boolean;
@@ -42,6 +54,8 @@ export interface FrameOptions {
 export interface FrameResult {
   /** Compute dispatches recorded, including the shading pass. */
   readonly dispatches: number;
+  /** Draw calls recorded: the composite, plus the scene when one is drawn. */
+  readonly draws: number;
   /** Command encoders used. Always one. */
   readonly encoders: number;
   /** Queue submissions. Always one. */
@@ -56,11 +70,24 @@ export interface FrameResult {
  * single submit at the end.
  */
 export function renderFrame(options: FrameOptions): FrameResult {
-  const { root, model, renderer, target, profiler, profile = false } = options;
+  const { root, model, renderer, target, scene, profiler, profile = false } = options;
 
   profiler?.beginFrame();
 
   const encoder = root['~unstable'].createCommandEncoder({ label: 'illumina-frame' });
+
+  if (scene) {
+    const scenePass = encoder.beginRenderPass({
+      label: 'procedural-scene',
+      colorAttachments: [
+        { view: scene.colorTarget, loadOp: 'clear', storeOp: 'store' },
+        { view: scene.truthTarget, loadOp: 'clear', storeOp: 'store' },
+      ],
+    });
+    scene.record(scenePass);
+    scenePass.end();
+  }
+
   const parity = model.outputParity();
 
   const dispatches = model.stats.dispatches + 1;
@@ -116,5 +143,5 @@ export function renderFrame(options: FrameOptions): FrameResult {
   profiler?.afterSubmit();
   model.swapHistory();
 
-  return { dispatches, encoders: 1, submits: 1 };
+  return { dispatches, draws: scene ? 2 : 1, encoders: 1, submits: 1 };
 }

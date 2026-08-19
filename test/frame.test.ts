@@ -20,6 +20,7 @@ import { createRenderer, DEFAULT_SETTINGS, type ShadingSettings } from '../src/l
 import { renderFrame } from '../src/engine/frame.ts';
 import { GpuProfiler } from '../src/engine/timing.ts';
 import type { LightDescription } from '../src/lighting/lights.ts';
+import { createSceneSource } from '../src/scene/source.ts';
 
 const SIZE = 64;
 const OUT = 64;
@@ -231,6 +232,71 @@ describe('frame graph', () => {
     }
 
     profiler.destroy();
+    model.destroy();
+    renderer.destroy();
+  });
+});
+
+describe('procedural scene through the whole pipeline', () => {
+  it('renders scene, depth, lighting and composite in one encoder', async () => {
+    const { root } = await headlessGpu();
+    const arch = buildArchitecture(SIZE);
+
+    const source = createSceneSource(root, SIZE);
+    const model = createDepthModel(root, {
+      arch,
+      weights: synthesizeWeights(arch, 8080),
+      source: source.texture,
+    });
+    const renderer = createRenderer(root, {
+      width: OUT,
+      height: OUT,
+      depthSize: SIZE,
+      albedo: source.texture,
+      depthTextures: [model.debugDepth(0), model.debugDepth(1)],
+      presentFormat: FORMAT,
+    });
+    renderer.setLights(KEY_LIGHT);
+
+    const target = root.createTexture({ size: [OUT, OUT], format: FORMAT }).$usage('render');
+    const view = target.createView('render');
+
+    source.update(2.0, false);
+    renderer.update(DEFAULT_SETTINGS, 0);
+
+    const result = renderFrame({
+      root,
+      model,
+      renderer,
+      target: view,
+      scene: {
+        record: (pass) => source.record(pass),
+        colorTarget: source.texture.createView('render'),
+        truthTarget: source.truth.createView('render'),
+      },
+    });
+
+    // The scene draw plus the composite draw.
+    expect(result.draws).toBe(2);
+    expect(result.encoders).toBe(1);
+    expect(result.submits).toBe(1);
+
+    const pixels = await readTarget(root, target);
+    let sum = 0;
+    let max = 0;
+    const distinct = new Set<number>();
+    for (let i = 0; i < pixels.length; i += 4) {
+      const v = (pixels[i]! + pixels[i + 1]! + pixels[i + 2]!) / 3;
+      sum += v;
+      max = Math.max(max, v);
+      distinct.add(pixels[i]!);
+    }
+    const mean = sum / (OUT * OUT);
+    expect(mean, 'composite is black').toBeGreaterThan(4);
+    expect(max, 'composite has no highlights').toBeGreaterThan(30);
+    expect(distinct.size, 'composite is a flat colour').toBeGreaterThan(16);
+
+    source.stop();
     model.destroy();
     renderer.destroy();
   });
