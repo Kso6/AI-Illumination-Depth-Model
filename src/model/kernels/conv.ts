@@ -14,6 +14,9 @@ import type { Activation } from '../arch.ts';
 import { activationFn } from './activation.ts';
 import { block4, type BuiltKernel } from './pointwise.ts';
 
+/** See the note on `LOAD_COST` in `../layout.ts`. */
+const LOAD_COST = 4;
+
 export const convLayout = tgpu
   .bindGroupLayout({
     src: { storage: (n: number) => d.arrayOf(d.vec4f, n), access: 'readonly' },
@@ -38,15 +41,25 @@ export interface ConvConfig {
 /**
  * Picks a workgroup shape for a spatially-indexed kernel: `ocLanes` threads
  * along the channel axis and `tx × ty` along the image, 64 threads in total.
+ *
+ * Costed the same way as `chooseTiling`, with an extra halo term: a k×k kernel
+ * reads a `(tileX + k - 1) × (ty + k - 1)` input region, so a 2×32 tile pays a
+ * far larger halo than an 8×8 tile of the same area. Without that term the
+ * search happily returns long, thin tiles that are legal but read the input
+ * several times over.
+ *
+ * @param k Kernel extent, for the halo term. Use 1 for purely pointwise work.
  */
 export function spatialTiling(
   outC4: number,
   outW: number,
   outH: number,
   maxAcc: number,
+  inC4 = 8,
+  k = 3,
 ): { ocLanes: number; tx: number; ty: number; pptX: number; oc4PerThread: number } {
   let best = { ocLanes: 1, tx: 8, ty: 8, pptX: 1, oc4PerThread: 1 };
-  let bestScore = -Infinity;
+  let bestCost = Infinity;
   for (const ocLanes of [1, 2, 4, 8]) {
     const spatial = 64 / ocLanes;
     for (const tx of [1, 2, 4, 8, 16, 32, 64]) {
@@ -58,13 +71,17 @@ export function spatialTiling(
           if (pptX * oc4PerThread > maxAcc) continue;
           const chanTile = ocLanes * oc4PerThread;
           const tileX = tx * pptX;
-          const waste =
-            ((Math.ceil(outC4 / chanTile) * chanTile) / outC4) *
-            ((Math.ceil(outW / tileX) * tileX) / outW) *
-            ((Math.ceil(outH / ty) * ty) / outH);
-          const score = -Math.log(waste) * 6 + Math.log(pptX * oc4PerThread) * 0.6;
-          if (score > bestScore) {
-            bestScore = score;
+          const pixTile = tileX * ty;
+
+          const workgroups =
+            Math.ceil(outC4 / chanTile) * Math.ceil(outW / tileX) * Math.ceil(outH / ty);
+          const macs = pixTile * chanTile * 4 * inC4 * 4 * k * k;
+          const inputLoads = (tileX + k - 1) * (ty + k - 1) * inC4;
+          const weightLoads = chanTile * inC4 * 4 * k * k;
+
+          const cost = workgroups * (macs + LOAD_COST * (inputLoads + weightLoads));
+          if (cost < bestCost) {
+            bestCost = cost;
             best = { ocLanes, tx, ty, pptX, oc4PerThread };
           }
         }
@@ -77,7 +94,7 @@ export function spatialTiling(
 export function makeConv(cfg: ConvConfig): BuiltKernel {
   const { inC4, outC4, inH, inW, outH, outW, k, stride } = cfg;
   const pad = (k - 1) >> 1;
-  const t = spatialTiling(outC4, outW, outH, 8);
+  const t = spatialTiling(outC4, outW, outH, 8, inC4, k);
   const { ocLanes, tx, ty, pptX, oc4PerThread } = t;
   const tileX = tx * pptX;
 

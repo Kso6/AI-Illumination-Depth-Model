@@ -82,6 +82,9 @@ export interface DwPwTiling {
 /** Workgroup memory budget. The WebGPU guaranteed minimum is 16 KiB. */
 const MAX_LDS_BYTES = 16384;
 
+/** See the note on `LOAD_COST` in `../layout.ts`. */
+const LOAD_COST = 4;
+
 /**
  * Picks a workgroup shape by explicitly costing the two things that matter:
  * duplicated depthwise work, and idle lanes.
@@ -119,18 +122,23 @@ export function chooseDwPwTiling(cfg: DwPwConfig): DwPwTiling {
 
             const recompute = Math.ceil(outC4 / chanTile);
 
-            // Cost model, in multiply-accumulates per output pixel.
-            const dwMacs = recompute * inC4 * 4 * k * k;
-            const pwMacs = outC4 * 4 * inC4 * 4;
-            // Idle lanes when the tensor does not divide evenly by the tile.
-            const waste =
-              ((Math.ceil(outC4 / chanTile) * chanTile) / outC4) *
-              ((Math.ceil(cfg.outW / tileX) * tileX) / cfg.outW) *
-              ((Math.ceil(cfg.outH / ty) * ty) / cfg.outH);
-            // Weight traffic amortised over the pixels in a workgroup.
-            const weightPenalty = (outC4 * inC4 * 4) / pixTile;
+            // Whole-op cost: workgroups × (MACs + LOAD_COST × loads). Using
+            // `ceil` for the workgroup count prices idle lanes automatically.
+            const workgroups =
+              recompute * Math.ceil(cfg.outW / tileX) * Math.ceil(cfg.outH / ty);
 
-            const cost = (dwMacs + pwMacs) * waste + weightPenalty * 0.35;
+            // Per workgroup. The depthwise runs once for the whole tile thanks to
+            // the workgroup-memory staging, so it is *not* multiplied by chanTile.
+            const dwMacs = pixTile * inC4 * 4 * k * k;
+            const pwMacs = pixTile * chanTile * 4 * inC4 * 4;
+
+            // Input reads carry a halo of k-1 in each direction; a tall, narrow
+            // tile pays far more for that halo than a square one of equal area,
+            // which is what makes this term choose squarish tiles.
+            const inputLoads = (tileX + k - 1) * (ty + k - 1) * inC4;
+            const weightLoads = chanTile * inC4 * 4 + inC4 * k * k;
+
+            const cost = workgroups * (dwMacs + pwMacs + LOAD_COST * (inputLoads + weightLoads));
             if (cost < bestCost) {
               bestCost = cost;
               best = {

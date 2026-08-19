@@ -163,19 +163,33 @@ export interface Tiling {
 const WORKGROUP_THREADS = 64;
 
 /**
- * Chooses a workgroup shape for a pointwise-style kernel.
+ * Relative cost of one `vec4` load against one multiply-accumulate.
  *
- * Priorities, in order:
- *  1. `ocLanes · oc4PerThread` must divide the output channel groups where
- *     possible, so no lane is idle.
- *  2. Prefer more pixel lanes than channel lanes: pixels are plentiful and give
- *     coalesced reads, whereas channel lanes re-read the same input.
- *  3. Keep the accumulator count (`ppt · oc4PerThread`) at 8 `vec4`s or fewer so
- *     occupancy stays high.
+ * These kernels are not ALU-bound: the tensors are small enough to sit in cache,
+ * but a load still costs several MACs' worth of issue slots and latency. Pricing
+ * loads at four MACs is what makes the search prefer tilings that re-read
+ * weights and inputs less, rather than merely tilings that keep every lane busy.
  */
-export function chooseTiling(outC4: number, pixels: number): Tiling {
+const LOAD_COST = 4;
+
+/**
+ * Chooses a workgroup shape for a pointwise-style kernel by costing the whole
+ * op, not by scoring heuristics.
+ *
+ * For a candidate tiling, the total work is
+ *
+ *     workgroups × (MACs per workgroup + LOAD_COST × loads per workgroup)
+ *
+ * where the workgroup count uses `ceil`, so idle lanes are paid for
+ * automatically, and the load term counts the weight block each workgroup must
+ * re-read and the inputs each channel tile must re-read. That single expression
+ * captures lane waste, weight reuse and input reuse together, which the previous
+ * hand-weighted score did not: it would happily pick a tiling covering four
+ * pixels per workgroup and re-read the entire weight matrix for each of them.
+ */
+export function chooseTiling(outC4: number, pixels: number, inC4 = 16): Tiling {
   let best: Tiling | undefined;
-  let bestScore = -Infinity;
+  let bestCost = Infinity;
 
   for (const ocLanes of [1, 2, 4, 8, 16]) {
     const pixLanes = WORKGROUP_THREADS / ocLanes;
@@ -187,20 +201,17 @@ export function chooseTiling(outC4: number, pixels: number): Tiling {
         const chanTile = ocLanes * oc4PerThread;
         const pixTile = pixLanes * ppt;
 
-        // Fraction of launched threads that do useful work.
-        const chanWaste = (Math.ceil(outC4 / chanTile) * chanTile) / outC4;
-        const pixWaste = (Math.ceil(pixels / pixTile) * pixTile) / pixels;
+        const workgroups = Math.ceil(outC4 / chanTile) * Math.ceil(pixels / pixTile);
 
-        const score =
-          // Idle lanes are by far the most expensive mistake.
-          -Math.log(chanWaste * pixWaste) * 6 +
-          // Reward arithmetic intensity: more work per thread amortises loads.
-          Math.log(ppt * oc4PerThread) * 0.6 +
-          // Mild preference for pixel-major layouts (coalesced loads).
-          Math.log(pixLanes) * 0.25;
+        // Per workgroup: every pixel in the tile against every output channel in
+        // the tile, summed over the input channels.
+        const macs = pixTile * chanTile * 4 * inC4 * 4;
+        // The 4×4 weight blocks for this channel tile, plus the input tile.
+        const loads = chanTile * inC4 * 4 + pixTile * inC4;
 
-        if (score > bestScore) {
-          bestScore = score;
+        const cost = workgroups * (macs + LOAD_COST * loads);
+        if (cost < bestCost) {
+          bestCost = cost;
           best = {
             ocLanes,
             pixLanes,

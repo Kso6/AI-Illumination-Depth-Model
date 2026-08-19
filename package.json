@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "arch": "vite-node scripts/arch-report.ts"
+    "arch": "vite-node scripts/arch-report.ts",
+    "dispatch": "vite-node scripts/dispatch-report.ts"
   },
   "dependencies": {
     "typegpu": "0.12.0"

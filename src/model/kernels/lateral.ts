@@ -53,7 +53,7 @@ export function makeLateral(cfg: LateralConfig): BuiltKernel {
 
   // One thread per coarse texel; four output pixels each, so the accumulator
   // budget is spent on channels rather than pixels.
-  const t = spatialTiling(outC4, coarseW, coarseH, 2);
+  const t = spatialTiling(outC4, coarseW, coarseH, 2, skipC4, 1);
   const { ocLanes, tx, ty, oc4PerThread } = t;
 
   const act = activationFn(cfg.act);

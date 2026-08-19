@@ -63,7 +63,7 @@ export interface BuiltKernel {
 
 export function makePointwise(cfg: PointwiseConfig): BuiltKernel {
   const { inC4, outC4, pixels, residual } = cfg;
-  const t = chooseTiling(outC4, pixels);
+  const t = chooseTiling(outC4, pixels, inC4);
   const { ocLanes, pixLanes, ppt, oc4PerThread } = t;
 
   const act = activationFn(cfg.act);
