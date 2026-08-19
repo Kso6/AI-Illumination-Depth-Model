@@ -17,8 +17,17 @@ import { makePointwise, pointwiseLayout } from '../src/model/kernels/pointwise.t
 import { dwpwLayout, makeDepthwisePointwise } from '../src/model/kernels/dwpw.ts';
 import { convLayout, makeConv } from '../src/model/kernels/conv.ts';
 import { lateralLayout, makeLateral } from '../src/model/kernels/lateral.ts';
+import { PreprocessParams, makePreprocess, preprocessLayout } from '../src/model/kernels/io.ts';
+import { uploadImage, readRgba16f } from './helpers/textures.ts';
+import { textureStorage2d, vec2f, vec4f } from 'typegpu/data';
 import { packBias, packConv, packDepthwise, packPointwise } from '../src/model/layout.ts';
-import { refConv, refDepthwisePointwise, refLateral, refPointwise } from '../src/model/reference.ts';
+import {
+  refConv,
+  refDepthwisePointwise,
+  refLateral,
+  refPointwise,
+  refPreprocess,
+} from '../src/model/reference.ts';
 import type { Activation } from '../src/model/arch.ts';
 
 describe('pointwise convolution', () => {
@@ -281,4 +290,57 @@ describe('FPN lateral fusion', () => {
       expect(cmp.worst, `maxAbs=${cmp.maxAbs.toExponential(3)} ${kernel.tiling}`).toEqual([]);
     });
   }
+});
+
+describe('preprocess', () => {
+  it('normalises, linearises and mirrors the source into scene colour', async () => {
+    const { root } = await headlessGpu();
+    const SIZE = 32;
+    const rand = mulberry32(0xa11ce);
+
+    const bytes = new Uint8Array(SIZE * SIZE * 4);
+    for (let i = 0; i < bytes.length; i += 4) {
+      bytes[i] = Math.floor(rand() * 256);
+      bytes[i + 1] = Math.floor(rand() * 256);
+      bytes[i + 2] = Math.floor(rand() * 256);
+      bytes[i + 3] = 255;
+    }
+    const source = uploadImage(root, SIZE, bytes);
+
+    const mean = [0.485, 0.456, 0.406] as const;
+    const std = [0.229, 0.224, 0.225] as const;
+    const EXPOSURE = 1.3;
+
+    const kernel = makePreprocess({ size: SIZE, mean, std });
+    const dst = allocVec4(root, SIZE * SIZE * 4);
+    const sceneColor = root
+      .createTexture({ size: [SIZE, SIZE], format: 'rgba16float' })
+      .$usage('sampled', 'storage');
+
+    const group = root.createBindGroup(preprocessLayout, {
+      source,
+      samp: root.createSampler({ magFilter: 'linear', minFilter: 'linear' }),
+      params: root.createUniform(PreprocessParams, {
+        uvScale: vec2f(1, 1),
+        uvOffset: vec2f(0, 0),
+        options: vec4f(1, EXPOSURE, 0, 0),
+      }),
+      dst,
+      sceneColor: sceneColor.createView(textureStorage2d('rgba16float', 'write-only')),
+    });
+    root.createComputePipeline({ compute: kernel.fn }).with(group).dispatchWorkgroups(...kernel.dispatch);
+
+    const rgbaFloat = new Float32Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) rgbaFloat[i] = bytes[i]! / 255;
+    const want = refPreprocess(rgbaFloat, SIZE, mean, std, true, EXPOSURE);
+
+    const gotInput = await download(root, dst, SIZE * SIZE * 4);
+    const inputCmp = compare(gotInput, want.input.data, { abs: 1e-5, rel: 1e-5 });
+    expect(inputCmp.worst, `input maxAbs=${inputCmp.maxAbs.toExponential(3)}`).toEqual([]);
+
+    // Scene colour is fp16, so only ~3 decimal digits survive.
+    const gotScene = await readRgba16f(root, sceneColor, SIZE);
+    const sceneCmp = compare(gotScene, want.sceneColor.data, { abs: 2e-3, rel: 2e-3 });
+    expect(sceneCmp.worst, `sceneColor maxAbs=${sceneCmp.maxAbs.toExponential(3)}`).toEqual([]);
+  });
 });

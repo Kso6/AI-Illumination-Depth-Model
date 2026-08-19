@@ -79,7 +79,7 @@ interface IdmHeader {
 const MAGIC = 'idm/1';
 
 /** Decodes an fp16 bit pattern to a JavaScript number. */
-function halfToFloat(h: number): number {
+export function halfToFloat(h: number): number {
   const sign = (h & 0x8000) >> 15;
   const exp = (h & 0x7c00) >> 10;
   const frac = h & 0x03ff;

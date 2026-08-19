@@ -45,11 +45,21 @@ export async function headlessGpu(): Promise<HeadlessGpu> {
     }
   }
 
-  const instance = mod.create([]);
+  // `allow_unsafe_apis` is needed purely to work around a bug in this Dawn Node
+  // build: its binding layer attaches a component-swizzle struct to *every*
+  // `createView` descriptor, so any view at all fails validation unless the
+  // `texture-component-swizzle` feature is enabled — and that feature is itself
+  // gated behind the toggle. Browsers do not exhibit this, and nothing under
+  // `src/` requests the feature; it is confined to the test harness.
+  const instance = mod.create(['enable-dawn-features=allow_unsafe_apis']);
   const adapter = await instance.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('headlessGpu: no WebGPU adapter available');
 
-  const wanted: GPUFeatureName[] = ['shader-f16', 'timestamp-query'];
+  const wanted = [
+    'shader-f16',
+    'timestamp-query',
+    'texture-component-swizzle',
+  ] as GPUFeatureName[];
   const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
 
   const device = await adapter.requestDevice({

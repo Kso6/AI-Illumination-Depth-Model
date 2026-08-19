@@ -176,203 +176,216 @@ export interface Architecture {
 }
 
 // ---------------------------------------------------------------------------
-// Builder helpers — keep the definition below readable.
-// ---------------------------------------------------------------------------
-
-const tensors: Record<TensorName, TensorShape> = {};
-const ops: Op[] = [];
-
-function T(name: TensorName, h: number, w: number, c: number): TensorName {
-  if (c % 4 !== 0) {
-    throw new Error(`tensor ${name}: channel count ${c} is not a multiple of 4`);
-  }
-  tensors[name] = { h, w, c };
-  return name;
-}
-
-function push<O extends Op>(op: O): O {
-  ops.push(op);
-  return op;
-}
-
-// ---------------------------------------------------------------------------
 // The network.
 // ---------------------------------------------------------------------------
 
-const S = 448;
-
-/** Normalised RGB input, 448×448×4 (alpha carries luminance for later reuse). */
-const x0 = T('input', S, S, 4);
-push({ kind: 'preprocess', name: 'preprocess', out: x0 });
-
-// --- Stem: 448 → 224 -------------------------------------------------------
-const stem = T('stem', 224, 224, 16);
-push({ kind: 'conv', name: 'stem', in: x0, out: stem, k: 3, stride: 2, act: 'hardswish' });
-
-// A depthwise-separable block with no expansion, as in MobileNetV2's first
-// bottleneck. Produces the highest-resolution skip.
-const s0 = T('s0', 224, 224, 24);
-push({
-  kind: 'dwpw',
-  name: 'e1',
-  in: stem,
-  out: s0,
-  k: 3,
-  stride: 1,
-  midAct: 'relu6',
-  act: 'linear',
-});
-
 /**
- * A downsampling block. The depthwise runs *first*, at stride 2, so the
- * expensive channel expansion happens at the lower resolution — a 4× saving
- * versus MobileNetV2's ordering, which expands before downsampling.
+ * Builds the architecture at a given square input resolution.
  *
- * Emits two dispatches: `dwpw` (depthwise s2 → expand) and `pw` (project).
+ * The resolution is a parameter rather than a constant so the test-suite can
+ * instantiate a geometrically identical but much smaller network (`448 / 7 = 64`)
+ * and compare a full forward pass against the CPU reference in seconds rather
+ * than minutes. `inputSize` must be divisible by 32, since the encoder
+ * downsamples five times.
  */
-function downBlock(
-  prefix: string,
-  input: TensorName,
-  h: number,
-  w: number,
-  expand: number,
-  out: number,
-  k: number,
-): TensorName {
-  const mid = T(`${prefix}.mid`, h, w, expand);
+export function buildArchitecture(inputSize: number): Architecture {
+  if (inputSize % 32 !== 0) {
+    throw new Error(`inputSize ${inputSize} must be a multiple of 32`);
+  }
+
+  const tensors: Record<TensorName, TensorShape> = {};
+  const ops: Op[] = [];
+
+  const T = (name: TensorName, h: number, w: number, c: number): TensorName => {
+    if (c % 4 !== 0) {
+      throw new Error(`tensor ${name}: channel count ${c} is not a multiple of 4`);
+    }
+    tensors[name] = { h, w, c };
+    return name;
+  };
+  const push = (op: Op): void => {
+    ops.push(op);
+  };
+
+  const S = inputSize;
+  const r = (level: number) => S >> level;
+
+  /** Normalised RGB input; the alpha channel carries luminance for later reuse. */
+  const x0 = T('input', S, S, 4);
+  push({ kind: 'preprocess', name: 'preprocess', out: x0 });
+
+  // --- Stem: S → S/2 -------------------------------------------------------
+  const stem = T('stem', r(1), r(1), 16);
+  push({ kind: 'conv', name: 'stem', in: x0, out: stem, k: 3, stride: 2, act: 'hardswish' });
+
+  // A depthwise-separable block with no expansion, as in MobileNetV2's first
+  // bottleneck. Produces the highest-resolution skip.
+  const s0 = T('s0', r(1), r(1), 24);
   push({
     kind: 'dwpw',
-    name: `${prefix}.dw_expand`,
-    in: input,
-    out: mid,
-    k,
-    stride: 2,
-    midAct: 'linear',
-    act: 'hardswish',
-  });
-  const o = T(`${prefix}.out`, h, w, out);
-  push({ kind: 'pw', name: `${prefix}.project`, in: mid, out: o, act: 'linear' });
-  return o;
-}
-
-/**
- * A residual inverted-bottleneck block: expand 1×1 → depthwise k×k → project
- * 1×1, with the input added back. Two dispatches; the depthwise is fused into
- * the projection.
- */
-function irBlock(
-  prefix: string,
-  input: TensorName,
-  h: number,
-  w: number,
-  channels: number,
-  expand: number,
-  k: number,
-): TensorName {
-  const mid = T(`${prefix}.mid`, h, w, expand);
-  push({ kind: 'pw', name: `${prefix}.expand`, in: input, out: mid, act: 'hardswish' });
-  const o = T(`${prefix}.out`, h, w, channels);
-  push({
-    kind: 'dwpw',
-    name: `${prefix}.dw_project`,
-    in: mid,
-    out: o,
-    k,
-    stride: 1,
-    midAct: 'hardswish',
-    act: 'linear',
-    residual: input,
-  });
-  return o;
-}
-
-// --- Stage 1: 224 → 112, 32 channels ---------------------------------------
-let t = downBlock('e2', s0, 112, 112, 96, 32, 3);
-t = irBlock('e3', t, 112, 112, 32, 128, 3);
-const s1 = t;
-
-// --- Stage 2: 112 → 56, 56 channels ----------------------------------------
-t = downBlock('e4', s1, 56, 56, 128, 56, 5);
-t = irBlock('e5a', t, 56, 56, 56, 224, 5);
-t = irBlock('e5b', t, 56, 56, 56, 224, 5);
-const s2 = t;
-
-// --- Stage 3: 56 → 28, 104 channels ----------------------------------------
-t = downBlock('e6', s2, 28, 28, 224, 104, 5);
-t = irBlock('e7a', t, 28, 28, 104, 416, 5);
-t = irBlock('e7b', t, 28, 28, 104, 416, 5);
-t = irBlock('e7c', t, 28, 28, 104, 416, 5);
-const s3 = t;
-
-// --- Stage 4: 28 → 14, 176 channels (bottleneck) ---------------------------
-t = downBlock('e8', s3, 14, 14, 416, 176, 5);
-t = irBlock('e9a', t, 14, 14, 176, 704, 5);
-t = irBlock('e9b', t, 14, 14, 176, 704, 5);
-t = irBlock('e9c', t, 14, 14, 176, 704, 5);
-const bottleneck = t;
-
-// --- Decoder ---------------------------------------------------------------
-// A lightweight FPN. Each level upsamples the coarser tensor, adds a projected
-// encoder skip, then refines with one fused depthwise-separable convolution.
-
-const d4 = T('d4', 14, 14, 96);
-push({ kind: 'pw', name: 'd4.lateral', in: bottleneck, out: d4, act: 'hardswish' });
-
-/**
- * One decoder level. `channels` is the width at this level (which must match the
- * coarse tensor coming in); `nextChannels` is the width the level above expects,
- * produced by the refine step so the next lateral needs no projection.
- */
-function decoderLevel(
-  prefix: string,
-  coarse: TensorName,
-  skip: TensorName,
-  h: number,
-  w: number,
-  channels: number,
-  nextChannels: number,
-): TensorName {
-  const fused = T(`${prefix}.fused`, h, w, channels);
-  push({ kind: 'lateral', name: `${prefix}.lateral`, coarse, skip, out: fused, act: 'linear' });
-  const o = T(`${prefix}.out`, h, w, nextChannels);
-  push({
-    kind: 'dwpw',
-    name: `${prefix}.refine`,
-    in: fused,
-    out: o,
+    name: 'e1',
+    in: stem,
+    out: s0,
     k: 3,
     stride: 1,
-    midAct: 'hardswish',
-    act: 'hardswish',
-    // A residual is only meaningful when the width is unchanged.
-    ...(channels === nextChannels ? { residual: fused } : {}),
+    midAct: 'relu6',
+    act: 'linear',
   });
-  return o;
+
+  /**
+   * A downsampling block. The depthwise runs *first*, at stride 2, so the
+   * expensive channel expansion happens at the lower resolution — a 4× saving
+   * versus MobileNetV2's ordering, which expands before downsampling.
+   *
+   * Emits two dispatches: `dwpw` (depthwise s2 → expand) and `pw` (project).
+   */
+  const downBlock = (
+    prefix: string,
+    input: TensorName,
+    h: number,
+    w: number,
+    expand: number,
+    out: number,
+    k: number,
+  ): TensorName => {
+    const mid = T(`${prefix}.mid`, h, w, expand);
+    push({
+      kind: 'dwpw',
+      name: `${prefix}.dw_expand`,
+      in: input,
+      out: mid,
+      k,
+      stride: 2,
+      midAct: 'linear',
+      act: 'hardswish',
+    });
+    const o = T(`${prefix}.out`, h, w, out);
+    push({ kind: 'pw', name: `${prefix}.project`, in: mid, out: o, act: 'linear' });
+    return o;
+  };
+
+  /**
+   * A residual inverted-bottleneck block: expand 1×1 → depthwise k×k → project
+   * 1×1, with the input added back. Two dispatches; the depthwise is fused into
+   * the projection.
+   */
+  const irBlock = (
+    prefix: string,
+    input: TensorName,
+    h: number,
+    w: number,
+    channels: number,
+    expand: number,
+    k: number,
+  ): TensorName => {
+    const mid = T(`${prefix}.mid`, h, w, expand);
+    push({ kind: 'pw', name: `${prefix}.expand`, in: input, out: mid, act: 'hardswish' });
+    const o = T(`${prefix}.out`, h, w, channels);
+    push({
+      kind: 'dwpw',
+      name: `${prefix}.dw_project`,
+      in: mid,
+      out: o,
+      k,
+      stride: 1,
+      midAct: 'hardswish',
+      act: 'linear',
+      residual: input,
+    });
+    return o;
+  };
+
+  // --- Stage 1: S/2 → S/4, 32 channels -------------------------------------
+  let t = downBlock('e2', s0, r(2), r(2), 96, 32, 3);
+  t = irBlock('e3', t, r(2), r(2), 32, 128, 3);
+  const s1 = t;
+
+  // --- Stage 2: S/4 → S/8, 56 channels -------------------------------------
+  t = downBlock('e4', s1, r(3), r(3), 128, 56, 5);
+  t = irBlock('e5a', t, r(3), r(3), 56, 224, 5);
+  t = irBlock('e5b', t, r(3), r(3), 56, 224, 5);
+  const s2 = t;
+
+  // --- Stage 3: S/8 → S/16, 104 channels -----------------------------------
+  t = downBlock('e6', s2, r(4), r(4), 224, 104, 5);
+  t = irBlock('e7a', t, r(4), r(4), 104, 416, 5);
+  t = irBlock('e7b', t, r(4), r(4), 104, 416, 5);
+  t = irBlock('e7c', t, r(4), r(4), 104, 416, 5);
+  const s3 = t;
+
+  // --- Stage 4: S/16 → S/32, 176 channels (bottleneck) ---------------------
+  t = downBlock('e8', s3, r(5), r(5), 416, 176, 5);
+  t = irBlock('e9a', t, r(5), r(5), 176, 704, 5);
+  t = irBlock('e9b', t, r(5), r(5), 176, 704, 5);
+  t = irBlock('e9c', t, r(5), r(5), 176, 704, 5);
+  const bottleneck = t;
+
+  // --- Decoder -------------------------------------------------------------
+  // A lightweight FPN. Each level upsamples the coarser tensor, adds a projected
+  // encoder skip, then refines with one fused depthwise-separable convolution.
+  const d4 = T('d4', r(5), r(5), 96);
+  push({ kind: 'pw', name: 'd4.lateral', in: bottleneck, out: d4, act: 'hardswish' });
+
+  /**
+   * One decoder level. `channels` is the width at this level (which must match
+   * the coarse tensor coming in); `nextChannels` is the width the level above
+   * expects, produced by the refine step so the next lateral needs no
+   * projection of its own.
+   */
+  const decoderLevel = (
+    prefix: string,
+    coarse: TensorName,
+    skip: TensorName,
+    h: number,
+    w: number,
+    channels: number,
+    nextChannels: number,
+  ): TensorName => {
+    const fused = T(`${prefix}.fused`, h, w, channels);
+    push({ kind: 'lateral', name: `${prefix}.lateral`, coarse, skip, out: fused, act: 'linear' });
+    const o = T(`${prefix}.out`, h, w, nextChannels);
+    push({
+      kind: 'dwpw',
+      name: `${prefix}.refine`,
+      in: fused,
+      out: o,
+      k: 3,
+      stride: 1,
+      midAct: 'hardswish',
+      act: 'hardswish',
+      // A residual is only meaningful when the width is unchanged.
+      ...(channels === nextChannels ? { residual: fused } : {}),
+    });
+    return o;
+  };
+
+  const d3 = decoderLevel('d3', d4, s3, r(4), r(4), 96, 64);
+  const d2 = decoderLevel('d2', d3, s2, r(3), r(3), 64, 48);
+  const d1 = decoderLevel('d1', d2, s1, r(2), r(2), 48, 32);
+  const d0 = decoderLevel('d0', d1, s0, r(1), r(1), 32, 32);
+
+  // --- Head ----------------------------------------------------------------
+  // A single-channel inverse-depth (disparity) map at half resolution, then an
+  // edge-aware upsample to full resolution guided by the source image.
+  const depthLow = T('depth_low', r(1), r(1), 4);
+  push({ kind: 'head', name: 'head', in: d0, out: depthLow });
+
+  const depthFull = T('depth', S, S, 4);
+  push({ kind: 'bilateralUp', name: 'upsample', in: depthLow, out: depthFull });
+
+  return {
+    name: 'IlluminaDepth-448',
+    inputSize: S,
+    // ImageNet statistics, applied in linear-light space.
+    mean: [0.485, 0.456, 0.406],
+    std: [0.229, 0.224, 0.225],
+    tensors,
+    ops,
+  };
 }
 
-const d3 = decoderLevel('d3', d4, s3, 28, 28, 96, 64);
-const d2 = decoderLevel('d2', d3, s2, 56, 56, 64, 48);
-const d1 = decoderLevel('d1', d2, s1, 112, 112, 48, 32);
-const d0 = decoderLevel('d0', d1, s0, 224, 224, 32, 32);
-
-// --- Head ------------------------------------------------------------------
-// A single-channel inverse-depth (disparity) map at 224², then an edge-aware
-// upsample to full 448² guided by the source image.
-const depthLow = T('depth_low', 224, 224, 4);
-push({ kind: 'head', name: 'head', in: d0, out: depthLow });
-
-const depthFull = T('depth', S, S, 4);
-push({ kind: 'bilateralUp', name: 'upsample', in: depthLow, out: depthFull });
-
-export const ILLUMINA_DEPTH_448: Architecture = {
-  name: 'IlluminaDepth-448',
-  inputSize: S,
-  // ImageNet statistics, applied in linear-light space.
-  mean: [0.485, 0.456, 0.406],
-  std: [0.229, 0.224, 0.225],
-  tensors,
-  ops,
-};
+/** The shipping configuration: 448×448 input. */
+export const ILLUMINA_DEPTH_448: Architecture = buildArchitecture(448);
 
 // ---------------------------------------------------------------------------
 // Derived facts: parameter counts, FLOPs, dispatch count, memory.

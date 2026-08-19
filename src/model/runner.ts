@@ -117,6 +117,17 @@ export interface DepthModel {
   setExposure(exposure: number): void;
   setTemporal(baseAlpha: number, motionSensitivity: number, rangeSigma: number): void;
   readonly stats: DepthModelStats;
+  /**
+   * Looks up the arena buffer backing a named intermediate tensor, for tests and
+   * the debug visualiser.
+   *
+   * `liveAtEnd` is false when the arena has handed that buffer to a later
+   * tensor, in which case reading it after a full `record()` yields the *other*
+   * tensor's data, not this one's.
+   */
+  debugTensor(
+    name: string,
+  ): { buffer: Buf; shape: { h: number; w: number; c: number }; liveAtEnd: boolean } | undefined;
   destroy(): void;
 }
 
@@ -431,6 +442,17 @@ export function createDepthModel(root: TgpuRoot, options: DepthModelOptions): De
       depthPostParams.writePartial({
         options: d.vec4f(rangeSigma, baseAlpha, motionSensitivity, 0),
       });
+    },
+    debugTensor(name: string) {
+      const shape = arch.tensors[name];
+      const idx = plan.assignment.get(name);
+      if (!shape || idx === undefined) return undefined;
+      // The tensor still owns its buffer only if nothing written later shares it.
+      const producedAt = arch.ops.findIndex((op) => op.out === name);
+      const stolen = arch.ops.some(
+        (op, i) => i > producedAt && plan.assignment.get(op.out) === idx,
+      );
+      return { buffer: arena[idx]!, shape, liveAtEnd: !stolen };
     },
     stats,
     destroy() {

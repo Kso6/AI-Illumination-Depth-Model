@@ -17,7 +17,7 @@
  * without conversion.
  */
 
-import type { Activation } from './arch.ts';
+import type { Activation, Architecture } from './arch.ts';
 import { applyActivation } from './layout.ts';
 
 export interface RefTensor {
@@ -254,4 +254,198 @@ export function refHead(
     out.data[p * 4 + 3] = disparity;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-network reference
+// ---------------------------------------------------------------------------
+
+/** sRGB → linear, matching `srgbToLinear` in `kernels/io.ts`. */
+export function srgbToLinearScalar(c: number): number {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+export function luminanceOf(r: number, g: number, b: number): number {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+export interface PreprocessResult {
+  /** The network's input tensor. */
+  readonly input: RefTensor;
+  /** Linear-light colour at network resolution, the lighting pass's input. */
+  readonly sceneColor: RefTensor;
+}
+
+/**
+ * Reference for the preprocess kernel, given a source image already sampled at
+ * the network's resolution with components in `[0, 1]`.
+ */
+export function refPreprocess(
+  rgba: Float32Array,
+  size: number,
+  mean: readonly [number, number, number],
+  std: readonly [number, number, number],
+  decodeSrgb: boolean,
+  exposure: number,
+): PreprocessResult {
+  const input = refTensor(size, size, 4);
+  const sceneColor = refTensor(size, size, 4);
+  for (let p = 0; p < size * size; p++) {
+    const lin = [0, 1, 2].map((i) => {
+      const v = rgba[p * 4 + i]!;
+      return (decodeSrgb ? srgbToLinearScalar(v) : v) * exposure;
+    }) as [number, number, number];
+    sceneColor.data[p * 4] = lin[0];
+    sceneColor.data[p * 4 + 1] = lin[1];
+    sceneColor.data[p * 4 + 2] = lin[2];
+    sceneColor.data[p * 4 + 3] = 1;
+    for (let i = 0; i < 3; i++) {
+      input.data[p * 4 + i] = (lin[i]! - mean[i]!) / std[i]!;
+    }
+    input.data[p * 4 + 3] = luminanceOf(lin[0], lin[1], lin[2]);
+  }
+  return { input, sceneColor };
+}
+
+/**
+ * Reference for the joint-bilateral upsample, with no temporal history (the
+ * first frame), matching `makeDepthUpsample` in `kernels/io.ts`.
+ */
+export function refBilateralUpsample(
+  low: RefTensor,
+  guide: RefTensor,
+  rangeSigma: number,
+): RefTensor {
+  const full = low.h * 2;
+  const out = refTensor(full, full, 1);
+  const lumaAt = (x: number, y: number) => {
+    const i = (y * guide.w + x) * guide.c;
+    return luminanceOf(guide.data[i]!, guide.data[i + 1]!, guide.data[i + 2]!);
+  };
+  for (let y = 0; y < full; y++) {
+    for (let x = 0; x < full; x++) {
+      const lumaHere = lumaAt(x, y);
+      const cx = (x + 0.5) * 0.5 - 0.5;
+      const cy = (y + 0.5) * 0.5 - 0.5;
+      const bx = Math.floor(cx + 0.5);
+      const by = Math.floor(cy + 0.5);
+      let weighted = 0;
+      let total = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const qx = Math.max(0, Math.min(low.w - 1, bx + dx));
+          const qy = Math.max(0, Math.min(low.h - 1, by + dy));
+          const disparity = low.data[(qy * low.w + qx) * low.c]!;
+          const lumaThere = lumaAt(qx * 2, qy * 2);
+          const dxs = qx - cx;
+          const dys = qy - cy;
+          const spatial = Math.exp(-(dxs * dxs + dys * dys) * 0.5);
+          const dl = (lumaHere - lumaThere) / Math.max(rangeSigma, 1e-4);
+          const w = spatial * Math.exp(-dl * dl * 0.5);
+          weighted += disparity * w;
+          total += w;
+        }
+      }
+      out.data[y * full + x] = weighted / Math.max(total, 1e-6);
+    }
+  }
+  return out;
+}
+
+/**
+ * Runs the whole graph on the CPU. Returns every intermediate tensor, keyed by
+ * the architecture's tensor names, so a failing end-to-end test can be bisected
+ * to the first op that diverges.
+ */
+export function forwardReference(
+  arch: Architecture,
+  weights: ReadonlyMap<string, Float32Array>,
+  input: RefTensor,
+): Map<string, RefTensor> {
+  const values = new Map<string, RefTensor>();
+  values.set('input', input);
+
+  const get = (name: string): RefTensor => {
+    const t = values.get(name);
+    if (!t) throw new Error(`forwardReference: ${name} has not been produced yet`);
+    return t;
+  };
+  const w = (key: string): Float32Array => {
+    const v = weights.get(key);
+    if (!v) throw new Error(`forwardReference: missing weight ${key}`);
+    return v;
+  };
+  const channels = (name: string) => arch.tensors[name]!.c;
+
+  for (const op of arch.ops) {
+    switch (op.kind) {
+      case 'preprocess':
+        break;
+      case 'conv':
+        values.set(
+          op.out,
+          refConv(
+            get(op.in),
+            w(`${op.name}.weight`),
+            w(`${op.name}.bias`),
+            channels(op.out),
+            op.k,
+            op.stride,
+            op.act,
+          ),
+        );
+        break;
+      case 'pw':
+        values.set(
+          op.out,
+          refPointwise(
+            get(op.in),
+            w(`${op.name}.weight`),
+            w(`${op.name}.bias`),
+            channels(op.out),
+            op.act,
+            op.residual ? get(op.residual) : undefined,
+          ),
+        );
+        break;
+      case 'dwpw':
+        values.set(
+          op.out,
+          refDepthwisePointwise(
+            get(op.in),
+            w(`${op.name}.dw_weight`),
+            w(`${op.name}.dw_bias`),
+            op.midAct,
+            w(`${op.name}.pw_weight`),
+            w(`${op.name}.pw_bias`),
+            channels(op.out),
+            op.k,
+            op.stride,
+            op.act,
+            op.residual ? get(op.residual) : undefined,
+          ),
+        );
+        break;
+      case 'lateral':
+        values.set(
+          op.out,
+          refLateral(
+            get(op.coarse),
+            get(op.skip),
+            w(`${op.name}.weight`),
+            w(`${op.name}.bias`),
+            channels(op.out),
+            op.act,
+          ),
+        );
+        break;
+      case 'head':
+        values.set(op.out, refHead(get(op.in), w(`${op.name}.weight`), w(`${op.name}.bias`)[0]!));
+        break;
+      case 'bilateralUp':
+        // Needs the guide image; run `refBilateralUpsample` separately.
+        break;
+    }
+  }
+  return values;
 }
