@@ -114,6 +114,13 @@ export interface DepthModel {
   record(pass: TgpuComputePass): void;
   /** Advances the temporal history ping-pong. Call once per frame after record. */
   swapHistory(): void;
+  /**
+   * Index of the depth texture `record()` writes this frame, for callers that
+   * hold per-parity bind groups over the same ping-pong pair.
+   */
+  outputParity(): number;
+  /** Both depth ping-pong textures, so a consumer can build per-parity bind groups. */
+  debugDepth(index: number): WorkTexture;
   setExposure(exposure: number): void;
   setTemporal(baseAlpha: number, motionSensitivity: number, rangeSigma: number): void;
   readonly stats: DepthModelStats;
@@ -433,6 +440,8 @@ export function createDepthModel(root: TgpuRoot, options: DepthModelOptions): De
     swapHistory() {
       historyIndex = 1 - historyIndex;
     },
+    outputParity: () => 1 - historyIndex,
+    debugDepth: (index: number) => depth[index === 0 ? 0 : 1],
     setExposure(exposure: number) {
       preprocessParams.writePartial({
         options: d.vec4f(options.decodeSrgb === false ? 0 : 1, exposure, 0, 0),
