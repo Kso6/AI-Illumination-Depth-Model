@@ -273,14 +273,26 @@ export const horizonOcclusion = tgpu
   )
   .$name('horizonOcclusion');
 
-/** GGX normal distribution term. */
+/**
+ * GGX / Trowbridge-Reitz normal distribution term.
+ *
+ * Note the epsilon is *additive*, not a floor on the denominator. Since
+ * `denom = (n·h)²(a²-1) + 1` is bounded below by `a²`, it is strictly positive
+ * for any non-zero roughness, so the division only needs protecting against
+ * true underflow. An earlier version used `max(pi·denom², 1e-6)`, which for a
+ * smooth surface silently capped the distribution: at roughness 0.04 and
+ * `n·h = 1` it returned 2.56 where the correct peak is 1.24e5 — five orders of
+ * magnitude of missing specular, which reads as "polished materials look matte".
+ */
 export const distributionGGX = tgpu
   .fn([d.f32, d.f32], d.f32)((nDotH, roughness) => {
     'use gpu';
-    const a = roughness * roughness;
+    // Guard the caller, not the arithmetic: a mirror-perfect surface is a
+    // singularity in this model, so roughness is kept just above it.
+    const a = std.max(roughness, 1e-3) ** 2;
     const a2 = a * a;
     const denom = nDotH * nDotH * (a2 - 1) + 1;
-    return a2 / std.max(3.14159265 * denom * denom, 1e-6);
+    return a2 / (3.14159265 * denom * denom + 1e-20);
   })
   .$name('distributionGGX');
 

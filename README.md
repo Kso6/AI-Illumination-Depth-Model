@@ -30,7 +30,7 @@ submit ×1
 | Activation memory | **19.0 MB** with arena aliasing (63.1 MB without) |
 | Weight memory | 5.56 MB at fp32 |
 | Authoring | TypeScript kernels (`'use gpu'`) transpiled to WGSL by TypeGPU 0.12 |
-| Verification | 36 tests executing real WGSL on a real WebGPU device |
+| Verification | 79 tests executing real WGSL on a real WebGPU device |
 
 Everything in that table is measured, not estimated: run `npm run arch` for the
 layer table and open the app for the live counters.
@@ -103,7 +103,7 @@ Requires a browser with WebGPU: Chrome/Edge 113+, or Safari 18+.
 
 ```bash
 npm run build        # typecheck + production bundle
-npm test             # 36 tests on a real GPU (see "Testing" below)
+npm test             # 79 tests on a real GPU (see "Testing" below)
 npm run arch         # print the layer table, FLOP and parameter budget
 ```
 
@@ -224,21 +224,47 @@ and **executed**, then compared against the CPU reference in
 npm test
 ```
 
-* `kernels.test.ts` — every kernel against the reference, including ragged
-  shapes, stride 2, 5×5 kernels, residuals, and a check that out-of-range lanes
-  write nothing.
-* `network.test.ts` — the whole graph, instantiated at 64×64 (geometrically
-  identical, 49× less work) so a complete CPU forward pass can be compared
-  op by op. Also covers arena liveness and weight-container round-tripping.
-* `frame.test.ts` — the frame graph: one encoder, one submit, correct
-  ping-pong parity, lighting that responds to light position, and real
-  timestamp queries.
+**The network**
+* `kernels.test.ts` — every kernel against the reference: ragged shapes,
+  stride 2, 5×5 kernels, residuals, and a check that out-of-range lanes write
+  nothing.
+* `shapes.test.ts` — the awkward shapes: single pixels, single rows and
+  columns, channel counts that divide no tile evenly, input channel counts that
+  are not a multiple of the depthwise workgroup-memory chunk, and the exact
+  shapes the shipping network uses.
+* `network.test.ts` — the whole graph at 64×64 (geometrically identical, 49×
+  less work) compared op by op against a complete CPU forward pass. Also covers
+  arena liveness and weight-container round-tripping.
+* `shipping-config.test.ts` — builds and executes all forty dispatches at the
+  real 448×448, which is the only way to know the tilings chosen at full
+  resolution are legal.
+
+**The frame**
+* `frame.test.ts` — one encoder, one submit, correct ping-pong parity, lighting
+  that responds to light position, and real timestamp queries.
+* `dispatch-count.test.ts` — wraps the device and counts the WebGPU calls that
+  actually happen, so the "one encoder, one submit, no readbacks" claim is
+  measured rather than asserted.
+* `timing.test.ts` — the profiler's staging ring under back-to-back frames.
+
+**The lighting**
+* `brdf.test.ts` — the GGX and Smith terms against their published closed forms.
+* `extremes.test.ts` — every UI slider at both ends, scanned for NaN and infinity.
+* `shading.test.ts` — the shading kernel driven by a hand-authored depth map, so
+  the geometry is known exactly.
+* `metrics.test.ts` — depth metrics against closed-form answers.
 * `scene.test.ts` — the procedural scene renders geometry and consistent depth.
 
-Two bugs were found by exactly this arrangement having two independent
-implementations: a border-clamping error in the CPU bilinear upsample, and a
-reference-vs-value aliasing bug in a kernel. Neither would have been visible
-from a screenshot.
+**The Python contract**
+* `interop.test.ts` — the exporter and the loader agree on weight names, shapes
+  and blob order, and a container written by Python is read back by TypeScript.
+
+Having two independent implementations is what found the real bugs: a
+border-clamping error in the CPU bilinear upsample, a reference-vs-value
+aliasing bug in a kernel, two lifetime defects in the profiler's staging ring,
+and a denominator floor that was silently capping the specular highlight on
+smooth surfaces by five orders of magnitude. None would have been visible from
+a screenshot.
 
 ### Note on headless browsers
 
