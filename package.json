@@ -1,0 +1,32 @@
+{
+  "name": "illumina-depth",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Real-time 448x448 monocular depth estimation running entirely on the GPU in TypeGPU, feeding a depth-aware lighting pass through a single command encoder.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "wgsl:dump": "vite-node scripts/dump-wgsl.ts",
+    "wgsl:validate": "vite-node scripts/dump-wgsl.ts && node scripts/validate-wgsl.mjs",
+    "bench": "vite-node scripts/bench.ts",
+    "weights:synth": "vite-node scripts/make-weights.ts"
+  },
+  "dependencies": {
+    "typegpu": "0.12.0"
+  },
+  "devDependencies": {
+    "@kmamal/gpu": "^0.2.1",
+    "@types/node": "^22.10.2",
+    "@webgpu/types": "^0.1.71",
+    "typescript": "^5.7.2",
+    "unplugin-typegpu": "^0.12.1",
+    "vite": "^6.0.7",
+    "vite-node": "^3.0.0",
+    "vitest": "^3.0.0"
+  }
+}
